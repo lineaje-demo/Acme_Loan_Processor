@@ -8,6 +8,7 @@ agent file via the `model=` argument on every call.
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any, Optional
 
@@ -40,6 +41,33 @@ def _extract_content(message: dict[str, Any]) -> str:
     return ""
 
 
+_HERE_IS_ANSWER = re.compile(r"here(?:'s| is| are)\b", re.IGNORECASE)
+_FORMATTED_PARAGRAPH = re.compile(r"(?:\*\*|#{1,6}\s|[-*]\s|\d+\.\s)")
+_MIN_RECOVERED_ANSWER_CHARS = 40
+
+
+def _answer_from_reasoning(reasoning: str) -> str:
+    """Recover the final answer when a reasoning model returns it inside
+    `reasoning` instead of `content` (Novita's deepseek-r1 does this: the
+    thinking and the answer arrive as one block, answer last).
+
+    Takes everything from the last "Here's / Here is ..." paragraph, else the
+    trailing run of markdown-formatted paragraphs. Returns "" if neither is
+    found, so the caller can retry."""
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", reasoning or "") if p.strip()]
+    answer = ""
+    for index in range(len(paragraphs) - 1, -1, -1):
+        if _HERE_IS_ANSWER.match(paragraphs[index]):
+            answer = "\n\n".join(paragraphs[index:])
+            break
+    else:
+        start = len(paragraphs)
+        while start > 0 and _FORMATTED_PARAGRAPH.match(paragraphs[start - 1]):
+            start -= 1
+        answer = "\n\n".join(paragraphs[start:])
+    return answer if len(answer) >= _MIN_RECOVERED_ANSWER_CHARS else ""
+
+
 class OpenAICompatibleClient:
     """Minimal async wrapper around a chat-completions style API."""
 
@@ -62,7 +90,7 @@ class OpenAICompatibleClient:
         messages: list[dict[str, Any]],
         temperature: float = 0.2,
         max_tokens: int = 400,
-        exclude_reasoning: bool = False,
+        recover_answer_from_reasoning: bool = False,
     ) -> str:
         payload: dict[str, Any] = {
             "model": model,
@@ -70,11 +98,6 @@ class OpenAICompatibleClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if exclude_reasoning:
-            # Keep a reasoning model's chain-of-thought out of the reply.
-            # Without this, Novita's deepseek-r1 often puts the whole answer in
-            # `reasoning` and leaves `content` empty.
-            payload["reasoning"] = {"exclude": True}
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -94,7 +117,15 @@ class OpenAICompatibleClient:
                     response.raise_for_status()
                     data = response.json()
                     choices = data.get("choices") or []
-                    content = _extract_content(choices[0].get("message") or {}) if choices else ""
+                    message = (choices[0].get("message") or {}) if choices else {}
+                    content = _extract_content(message)
+                    if not content and recover_answer_from_reasoning:
+                        content = _answer_from_reasoning(message.get("reasoning") or "")
+                        if content:
+                            logger.info(
+                                "Recovered answer from the reasoning field",
+                                extra={"model": model, "provider": data.get("provider")},
+                            )
                     if content:
                         return content
 
