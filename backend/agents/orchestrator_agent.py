@@ -127,6 +127,7 @@ class OrchestratorAgent(AcmeLoanAgentFramework):
                 "diagnostic steps",
                 "verify environment",
                 "environment setup",
+                "closing image",
             ]
         ):
             return environment_diagnostics_agent
