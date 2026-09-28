@@ -25,6 +25,71 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from agents.runtime import build_catalog, handle_chat_request, process_file_attachment
+import re
+
+_ai_app_sec_070_patterns = [
+    # 1. instruction_override
+    (re.compile(
+        r'ignore\s+(?:all\s+)?previous\s+instructions|forget\s+everything\s+above',
+        re.IGNORECASE), '<prompt_injection_removed: instruction_override>'),
+    # 2. role_hijack
+    (re.compile(
+        r'you\s+are\s+now\s+DAN|act\s+as\s+(?:an?\s+)?unrestricted',
+        re.IGNORECASE), '<prompt_injection_removed: role_hijack>'),
+    # 3. delimiter_escape - fake </system>, </prompt>, </instruction> tags or injected separators
+    (re.compile(
+        r'</?\s*(?:system|prompt|instruction|context|human|assistant)\s*>',
+        re.IGNORECASE), '<prompt_injection_removed: delimiter_escape>'),
+    # 6. fake_system_message
+    (re.compile(
+        r'\[\s*(?:SYSTEM|TOOL|ASSISTANT|USER)\s*\]\s*:',
+        re.IGNORECASE), '<prompt_injection_removed: fake_system_message>'),
+    # 7. exfiltration_attempt - markdown image exfil or instructions to send data to URLs
+    (re.compile(
+        r'!\[.*?\]\(https?://[^)]*\?[^)]*\)|send\s+(?:the\s+)?(?:system\s+prompt|data|contents?)\s+to\s+https?://|leak\s+(?:the\s+)?system\s+prompt',
+        re.IGNORECASE), '<prompt_injection_removed: exfiltration_attempt>'),
+    # 8. context_poisoning
+    (re.compile(
+        r'disregard\s+(?:all\s+)?(?:prior|previous)\s+(?:context|instructions?|messages?)|manipulate\s+(?:the\s+)?(?:context|conversation)',
+        re.IGNORECASE), '<prompt_injection_removed: context_poisoning>'),
+    # 10. command_injection - shell execution patterns
+    (re.compile(
+        r'(?:^|\s)(?:sudo\s+)?(?:rm\s+-rf|curl\s+.*\|\s*(?:bash|sh)|wget\s+.*\|\s*(?:bash|sh)|os\.system\s*\(|subprocess\.(?:call|run|Popen)\s*\(|eval\s*\(|exec\s*\()',
+        re.IGNORECASE | re.MULTILINE), '<prompt_injection_removed: command_injection>'),
+    # 12. jailbreak_attempt - DAN, developer mode, fictional framing
+    (re.compile(
+        r'\bDAN\b|developer\s+mode\s+enabled|pretend\s+you\s+(?:have\s+no\s+restrictions|are\s+(?:an?\s+)?(?:unrestricted|evil|unfiltered))|jailbreak',
+        re.IGNORECASE), '<prompt_injection_removed: jailbreak_attempt>'),
+    # 5. hidden_text - HTML comments, zero-width characters, CSS hidden
+    (re.compile(
+        r'<!--.*?-->|[\u200b\u200c\u200d\u200e\u200f\ufeff]|<span[^>]+display\s*:\s*none[^>]*>.*?</span>',
+        re.IGNORECASE | re.DOTALL), '<prompt_injection_removed: hidden_text>'),
+    # 4. encoded_payload - base64-encoded instructions, hex blobs, ROT13 hints
+    (re.compile(
+        r'(?:base64\s*(?:decode|encoded)|rot13|\\x[0-9a-fA-F]{2}(?:\\x[0-9a-fA-F]{2}){4,})',
+        re.IGNORECASE), '<prompt_injection_removed: encoded_payload>'),
+    # 9. indirect_injection - payloads in metadata fields or code comments
+    (re.compile(
+        r'#\s*(?:ignore|override|forget)\s+(?:previous\s+)?instructions',
+        re.IGNORECASE), '<prompt_injection_removed: indirect_injection>'),
+    # 11. split_payload - fragmented instructions
+    (re.compile(
+        r'(?:part\s*[1-9]\s*of\s*[1-9]|continued\s+from\s+(?:above|previous)).*?(?:ignore|override|forget)',
+        re.IGNORECASE | re.DOTALL), '<prompt_injection_removed: split_payload>'),
+]
+
+
+def _ai_app_sec_070_sanitize(text: str) -> str:
+    """Neutralize prompt injection patterns in user-supplied text before it reaches the LLM."""
+    if not text:
+        return text
+    for pattern, marker in _ai_app_sec_070_patterns:
+        text = pattern.sub(marker, text)
+    return text
+from lineaje_guardrail import lineaje_guardrail, GuardrailBlockedError
+
+_ai_app_sec_059_guardrail = lineaje_guardrail()
+_ai_app_sec_059_guardrail.enable_policies(["AI_APP_SEC_059.json"])
 
 # Configure logging
 logging.basicConfig(
@@ -139,15 +204,20 @@ async def chat(request: ChatRequest):
                     }
                 )
 
+                _ai_app_sec_059_attachment_content = attachment.content
+                _ai_app_sec_059_attachment_content = _ai_app_sec_059_guardrail.evaluate(_ai_app_sec_059_attachment_content)
+                                sanitized_attachment_content = _ai_app_sec_070_sanitize(attachment.content) if attachment.content else attachment.content
                 processed = await process_file_attachment(
-                    content=attachment.content,
+                    content=sanitized_attachment_content,
                     filename=attachment.name,
                     content_type=attachment.type
                 )
                 file_contents.append(processed)
 
+        _ai_app_sec_059_user_message = request.message
+        _ai_app_sec_059_user_message = _ai_app_sec_059_guardrail.evaluate(_ai_app_sec_059_user_message)
         context = {
-            "user_message": request.message,
+            "user_message": _ai_app_sec_059_user_message,
             "file_contents": file_contents,
             "conversation_id": request.conversation_id,
         }
@@ -215,6 +285,8 @@ async def upload_file(file: UploadFile = File(...)):
     else:
         processed_content = content.decode("utf-8", errors="ignore")
 
+    processed_content = _ai_app_sec_059_guardrail.evaluate(processed_content)
+    processed_content = _ai_app_sec_070_sanitize(processed_content)
     processed = await process_file_attachment(
         content=processed_content,
         filename=file.filename,
