@@ -338,6 +338,14 @@ export function ChatInterface() {
         inputRef.current?.focus()
       },
     },
+    {
+      // Unapproved LLM  →  Rate Check Agent (DeepSeek, not on the approved list)
+      label: 'Check current rates',
+      action: () => {
+        setInput("What are today's average interest rates for a 30-year fixed mortgage?")
+        inputRef.current?.focus()
+      },
+    },
   ]
 
   return (

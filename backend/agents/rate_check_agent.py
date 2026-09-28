@@ -16,6 +16,8 @@ class RateCheckAgent(AcmeLoanAgentFramework):
     AGENT_ID = "rate_check_agent"
     AGENT_NAME = "Rate_Check Agent"
     VERSION = "1.0.0"
+    # Vulnerability: this agent runs on DeepSeek, which is NOT on the
+    # organization's approved LLM list (AI_APP_SEC_006).
     OPENROUTER_MODEL = "deepseek/deepseek-r1"
     MODEL_NAME = "deepseek/deepseek-r1"
     BEDROCK_MODEL_ID = ""
@@ -28,7 +30,7 @@ class RateCheckAgent(AcmeLoanAgentFramework):
         "inter_agent_authentication": True,
     }
     SYSTEM_PROMPT = "Answer rate-check questions with short, practical lending-rate guidance."
-    IS_ROUTABLE = False
+    IS_ROUTABLE = True
 
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -127,8 +129,8 @@ class RateCheckAgent(AcmeLoanAgentFramework):
         model_output = self.sanitize_model_output(await self.call_agent_model(prompt_message))
 
         response = (
-            f"Rate check request: {safe_user_message}\n\n"
             f"Using model: {self.resolve_model()}\n\n"
+            f"Rate check request: {safe_user_message}\n\n"
             f"Rate summary:\n{model_output}"
         )
 

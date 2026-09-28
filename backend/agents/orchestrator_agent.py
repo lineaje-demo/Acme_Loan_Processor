@@ -10,6 +10,7 @@ from .file_management_agent import file_management_agent
 from .file_processor_agent import file_processor_agent
 from .framework import AcmeLoanAgentFramework
 from .loan_processing_agent import loan_processing_agent
+from .rate_check_agent import rate_check_agent
 from .scheduling_agent import scheduling_agent
 from .installed_skill_agent import installed_skill_agent
 
@@ -132,6 +133,8 @@ class OrchestratorAgent(AcmeLoanAgentFramework):
             ]
         ):
             return environment_diagnostics_agent
+        if self._should_route_to_rate_check(text):
+            return rate_check_agent
         if any(keyword in text for keyword in ["credit", "fico", "debt-to-income", "dti", "underwrite", "loan status", "employee", "ssn", "borrower status"]):
             return credit_eval_agent
         if any(keyword in text for keyword in ["loan", "mortgage", "borrower", "application"]):
@@ -163,6 +166,19 @@ class OrchestratorAgent(AcmeLoanAgentFramework):
             "review loan document",
         ]
         return any(keyword in text for keyword in skill_match_keywords)
+
+    @staticmethod
+    def _should_route_to_rate_check(text: str) -> bool:
+        rate_check_keywords = [
+            "interest rate",
+            "mortgage rate",
+            "rate check",
+            "current rates",
+            "average rate",
+            "30-year fixed",
+            "15-year fixed",
+        ]
+        return any(keyword in text for keyword in rate_check_keywords)
 
 
 orchestrator_agent = OrchestratorAgent()
