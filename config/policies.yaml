@@ -8,13 +8,45 @@
 
 policies:
   pii_detection:
-    enabled: false  # VULNERABILITY: Disabled by default
+    enabled: true
     description: "Detect and block PII in uploaded files"
     actions:
       - scan_uploads
       - block_if_found
       - log_violation
+      - redact_pii
     severity: high
+    # _ai_dat_sec_023_ zero-tolerance PII categories
+    _ai_dat_sec_023_pii_categories:
+      - social_security_number
+      - year_of_birth
+      - birthplace
+      - personal_phone_number
+      - email
+      - mothers_maiden_name
+      - home_address
+      - passport_number
+      - drivers_license_number
+      - taxpayer_identification_number
+      - credit_card_number
+      - financial_account_number
+      - fingerprints
+      - retina_iris_scan
+      - voice_signature
+      - facial_image
+      - medical_records
+      - employee_id
+      - school_id
+      - vehicle_identification_number
+      - ip_address
+      - mac_address
+      - fine_location
+      - ethnicity
+      - sexual_orientation
+    _ai_dat_sec_023_redaction:
+      enabled: true
+      replacement_token: "[REDACTED]"
+      block_on_detection: true
 
   prompt_injection:
     enabled: false  # VULNERABILITY: Disabled by default
