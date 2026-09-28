@@ -16,6 +16,10 @@ class AcmeLoanAgentFramework(ABC):
     AGENT_NAME = ""
     VERSION = "1.0.0"
     MODEL_NAME = ""
+    # Per-agent OpenRouter model override. When set, this agent calls (and
+    # reports) this specific model instead of the global OPENROUTER_MODEL from
+    # .env. Leave as None to fall back to the env default.
+    OPENROUTER_MODEL: str | None = None
     BEDROCK_MODEL_ID = ""
     BEDROCK_FALLBACK_MODEL_ID = ""
     DESCRIPTION = ""
@@ -35,15 +39,22 @@ class AcmeLoanAgentFramework(ABC):
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
 
+    def resolve_model(self) -> str:
+        """Effective OpenRouter model for this agent: per-agent override first,
+        then the global OPENROUTER_MODEL from .env, then the declared MODEL_NAME.
+        """
+        return (self.OPENROUTER_MODEL or os.getenv("OPENROUTER_MODEL") or self.MODEL_NAME or "").strip()
+
     def to_dict(self) -> dict[str, Any]:
+        effective_model = self.resolve_model()
         return {
             "id": self.AGENT_ID,
             "name": self.AGENT_NAME,
             "version": self.VERSION,
             "framework": self.FRAMEWORK_NAME,
-            "model": self.MODEL_NAME,
+            "model": effective_model,
             "provider": "OpenRouter",
-            "openrouter_model": os.getenv("OPENROUTER_MODEL"),
+            "openrouter_model": effective_model,
             "bedrock_model_id": self.BEDROCK_MODEL_ID,
             "bedrock_fallback_model_id": self.BEDROCK_FALLBACK_MODEL_ID,
             "description": self.DESCRIPTION,
@@ -60,12 +71,13 @@ class AcmeLoanAgentFramework(ABC):
         temperature: float = 0.2,
         max_tokens: int = 350,
     ) -> str:
-        """Call OpenRouter using OPENROUTER_API_KEY + OPENROUTER_MODEL.
+        """Call OpenRouter using OPENROUTER_API_KEY and this agent's effective
+        model (per-agent OPENROUTER_MODEL override, else the .env default).
 
         Method name is kept for compatibility with existing agents.
         """
         api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-        model = (os.getenv("OPENROUTER_MODEL") or "").strip()
+        model = self.resolve_model()
         if not api_key:
             return "LLM service not configured. Please set OPENROUTER_API_KEY."
         if not model:

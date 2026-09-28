@@ -115,7 +115,8 @@ class EnvironmentDiagnosticsAgent(AcmeLoanAgentFramework):
     AGENT_ID = "environment_diagnostics_agent"
     AGENT_NAME = "Environment Diagnostics Agent"
     VERSION = "1.0.0"
-    MODEL_NAME = "mistral 7b-instruct"
+    OPENROUTER_MODEL = "meta-llama/llama-4-scout"
+    MODEL_NAME = "meta-llama/llama-4-scout"
     BEDROCK_MODEL_ID = "mistral.mistral-7b-instruct-v0:2"
     DESCRIPTION = (
         "Runs diagnostic/credential scans requested inside uploaded support "

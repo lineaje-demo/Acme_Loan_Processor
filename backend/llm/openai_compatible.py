@@ -8,11 +8,19 @@ agent file via the `model=` argument on every call.
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Retry transient upstream failures (5xx / gateway timeouts / connection
+# resets). meta-llama/llama-4-scout on OpenRouter occasionally returns a 504
+# Gateway Timeout; a couple of quick retries smooth those over without
+# changing the async job-polling flow.
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_SEC = 1.5
 
 
 class OpenAICompatibleClient:
@@ -50,28 +58,58 @@ class OpenAICompatibleClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         def _post() -> str:
-            try:
-                response = requests.post(
-                    f"{self.base_url}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                    timeout=20,
-                )
-                response.raise_for_status()
-                data = response.json()
-                choices = data.get("choices", [])
-                if choices:
-                    message = choices[0].get("message", {})
-                    content = message.get("content", "")
-                    if isinstance(content, str):
-                        return content.strip()
-                return f"Model API returned no content for model {model}."
-            except requests.RequestException as exc:
-                logger.warning(
-                    "Model gateway request failed",
-                    extra={"model": model, "error": str(exc)},
-                )
-                return f"Model gateway unavailable for {model}: {exc}"
+            last_exc: Optional[Exception] = None
+            for attempt in range(1, _MAX_ATTEMPTS + 1):
+                try:
+                    response = requests.post(
+                        f"{self.base_url}/chat/completions",
+                        json=payload,
+                        headers=headers,
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    choices = data.get("choices", [])
+                    if choices:
+                        message = choices[0].get("message", {})
+                        content = message.get("content", "")
+                        if isinstance(content, str):
+                            return content.strip()
+                    return f"Model API returned no content for model {model}."
+                except requests.HTTPError as exc:
+                    last_exc = exc
+                    status = exc.response.status_code if exc.response is not None else None
+                    # Retry only on transient upstream 5xx (e.g. 504 gateway
+                    # timeout). 4xx are caller errors — fail fast.
+                    if status is not None and 500 <= status < 600 and attempt < _MAX_ATTEMPTS:
+                        logger.warning(
+                            "Model gateway %s — retrying (%d/%d)",
+                            status, attempt, _MAX_ATTEMPTS,
+                            extra={"model": model},
+                        )
+                        time.sleep(_RETRY_BACKOFF_SEC * attempt)
+                        continue
+                    break
+                except (requests.Timeout, requests.ConnectionError) as exc:
+                    last_exc = exc
+                    if attempt < _MAX_ATTEMPTS:
+                        logger.warning(
+                            "Model gateway network error — retrying (%d/%d): %s",
+                            attempt, _MAX_ATTEMPTS, exc,
+                            extra={"model": model},
+                        )
+                        time.sleep(_RETRY_BACKOFF_SEC * attempt)
+                        continue
+                    break
+                except requests.RequestException as exc:
+                    last_exc = exc
+                    break
+
+            logger.warning(
+                "Model gateway request failed",
+                extra={"model": model, "error": str(last_exc)},
+            )
+            return f"Model gateway unavailable for {model}: {last_exc}"
 
         return await asyncio.to_thread(_post)
 
