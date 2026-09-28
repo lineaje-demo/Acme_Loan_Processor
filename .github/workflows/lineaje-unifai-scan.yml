@@ -1,0 +1,41 @@
+name: Lineaje AI Policy Scan - Sept 2026
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  lineaje-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install mcp==1.27.1
+
+      - name: Prepare scanner
+        run: |
+          # Preserve the scanner before removing .github from scan input
+          cp .github/gha_repo_scan.py /tmp/gha_repo_scan.py
+
+          # Exclude GitHub config/workflows/scripts and git internals from the scan
+          rm -rf .github .git
+
+      - name: Run Lineaje AI policy scan
+        env:
+          LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python /tmp/gha_repo_scan.py \
+            --source-path . \
+            --create-fix-pr >> "$GITHUB_STEP_SUMMARY"
