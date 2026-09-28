@@ -16,11 +16,28 @@ import requests
 logger = logging.getLogger(__name__)
 
 # Retry transient upstream failures (5xx / gateway timeouts / connection
-# resets). meta-llama/llama-4-scout on OpenRouter occasionally returns a 504
-# Gateway Timeout; a couple of quick retries smooth those over without
-# changing the async job-polling flow.
-_MAX_ATTEMPTS = 3
+# resets / empty completions). meta-llama/llama-4-scout on OpenRouter
+# occasionally returns a 504 Gateway Timeout, and deepseek/deepseek-r1 (only
+# served by Novita) sometimes finishes with an empty `content`.
+_MAX_ATTEMPTS = 4
 _RETRY_BACKOFF_SEC = 1.5
+# Reasoning models such as deepseek-r1 take 15-30s per call.
+_REQUEST_TIMEOUT_SEC = 90
+
+
+def _extract_content(message: dict[str, Any]) -> str:
+    """Return the assistant text from a chat-completions message, accepting
+    either a plain string or a list of content parts."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        ]
+        return "".join(parts).strip()
+    return ""
 
 
 class OpenAICompatibleClient:
@@ -51,6 +68,11 @@ class OpenAICompatibleClient:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            # Ask OpenRouter to keep a reasoning model's chain-of-thought out of
+            # the reply. Without this, Novita's deepseek-r1 often puts the whole
+            # answer in `reasoning` and leaves `content` empty. Non-reasoning
+            # models ignore it.
+            "reasoning": {"exclude": True},
         }
 
         headers = {"Content-Type": "application/json"}
@@ -59,23 +81,39 @@ class OpenAICompatibleClient:
 
         def _post() -> str:
             last_exc: Optional[Exception] = None
+            empty_responses = 0
             for attempt in range(1, _MAX_ATTEMPTS + 1):
                 try:
                     response = requests.post(
                         f"{self.base_url}/chat/completions",
                         json=payload,
                         headers=headers,
-                        timeout=30,
+                        timeout=_REQUEST_TIMEOUT_SEC,
                     )
                     response.raise_for_status()
                     data = response.json()
-                    choices = data.get("choices", [])
-                    if choices:
-                        message = choices[0].get("message", {})
-                        content = message.get("content", "")
-                        if isinstance(content, str):
-                            return content.strip()
-                    return f"Model API returned no content for model {model}."
+                    choices = data.get("choices") or []
+                    content = _extract_content(choices[0].get("message") or {}) if choices else ""
+                    if content:
+                        return content
+
+                    # 200 OK but no answer text: transient provider behaviour,
+                    # so retry instead of surfacing an empty reply.
+                    empty_responses += 1
+                    last_exc = None
+                    if attempt < _MAX_ATTEMPTS:
+                        logger.warning(
+                            "Model returned empty content — retrying (%d/%d)",
+                            attempt, _MAX_ATTEMPTS,
+                            extra={
+                                "model": model,
+                                "provider": data.get("provider"),
+                                "finish_reason": choices[0].get("finish_reason") if choices else None,
+                            },
+                        )
+                        time.sleep(_RETRY_BACKOFF_SEC * attempt)
+                        continue
+                    break
                 except requests.HTTPError as exc:
                     last_exc = exc
                     status = exc.response.status_code if exc.response is not None else None
@@ -104,6 +142,16 @@ class OpenAICompatibleClient:
                 except requests.RequestException as exc:
                     last_exc = exc
                     break
+
+            if last_exc is None and empty_responses:
+                logger.warning(
+                    "Model returned empty content on every attempt",
+                    extra={"model": model, "attempts": empty_responses},
+                )
+                return (
+                    f"{model} returned an empty response {empty_responses} times in a row. "
+                    "The upstream provider is flaky right now — please try again."
+                )
 
             logger.warning(
                 "Model gateway request failed",

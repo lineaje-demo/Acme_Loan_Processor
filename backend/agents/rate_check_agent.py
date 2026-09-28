@@ -102,9 +102,9 @@ class RateCheckAgent(AcmeLoanAgentFramework):
                 },
             ],
             temperature=0.2,
-            # deepseek-r1 spends completion tokens on a hidden reasoning pass, so a
-            # small budget returns empty content. Leave room for reasoning and the answer.
-            max_tokens=900,
+            # deepseek-r1 spends completion tokens on a hidden reasoning pass (still
+            # counted even when excluded from the reply), so leave room for both.
+            max_tokens=1500,
         )
         logger.info(
             "Rate check LLM response",
