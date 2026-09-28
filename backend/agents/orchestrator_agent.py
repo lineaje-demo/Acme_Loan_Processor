@@ -1,6 +1,7 @@
 """Orchestrator Agent class with explicit model invocation."""
 
 import logging
+import os
 from typing import Any
 
 from .access_control_agent import access_control_agent
@@ -12,8 +13,42 @@ from .framework import AcmeLoanAgentFramework
 from .loan_processing_agent import loan_processing_agent
 from .scheduling_agent import scheduling_agent
 from .installed_skill_agent import installed_skill_agent
+from lineaje_guardrail import lineaje_guardrail
+
+_ai_app_sec_059_guardrail = lineaje_guardrail()
+_ai_app_sec_059_guardrail.enable_policies(["AI_APP_SEC_059.json"])
+
+import re
 
 logger = logging.getLogger(__name__)
+
+_ai_dat_sec_001_internal_hop_token = os.environ.get("INTERNAL_HOP_TOKEN")
+if not _ai_dat_sec_001_internal_hop_token:
+    raise RuntimeError("Required environment variable INTERNAL_HOP_TOKEN is not set")
+
+_ai_app_sec_070_patterns = [
+    (re.compile(r'ignore\s+previous\s+instructions|forget\s+everything\s+above', re.IGNORECASE), 'instruction_override'),
+    (re.compile(r'you\s+are\s+now\s+DAN|act\s+as\s+unrestricted', re.IGNORECASE), 'role_hijack'),
+    (re.compile(r'</?(system|tool|assistant|user)\s*>', re.IGNORECASE), 'delimiter_escape'),
+    (re.compile(r'(?:[A-Za-z0-9+/]{20,}={0,2}|\\x[0-9a-fA-F]{2}(?:\\x[0-9a-fA-F]{2})+|%[0-9a-fA-F]{2}(?:%[0-9a-fA-F]{2})+|(?:[0-9a-fA-F]{2}\s*){8,}|(?:\.-\.|-\.\.|\.-\.-)[\s.-]+)', re.IGNORECASE), 'encoded_payload'),
+    (re.compile(r'<!--.*?-->|\u200b|\u200c|\u200d|\u2060|\ufeff|display\s*:\s*none|visibility\s*:\s*hidden', re.IGNORECASE | re.DOTALL), 'hidden_text'),
+    (re.compile(r'\[system\]|<system>|\[tool\]|<tool>|\bSYSTEM\s*MESSAGE\b|\bTOOL\s*RESPONSE\b', re.IGNORECASE), 'fake_system_message'),
+    (re.compile(r'!\[.*?\]\(https?://[^)]+\)|send\s+(?:this\s+)?(?:data|info|prompt|context)\s+to\s+https?://|leak\s+(?:the\s+)?system\s+prompt|exfiltrate', re.IGNORECASE), 'exfiltration_attempt'),
+    (re.compile(r'in\s+(?:a\s+)?previous\s+(?:turn|message|conversation)|remember\s+(?:earlier|before)\s+(?:I\s+)?(?:said|told)', re.IGNORECASE), 'context_poisoning'),
+    (re.compile(r'(?:the\s+)?(?:file|document|metadata|field)\s+(?:says?|contains?|instructs?)\s+(?:you\s+)?(?:to\s+)?(?:ignore|forget|override)', re.IGNORECASE), 'indirect_injection'),
+    (re.compile(r'(?:^|\s)(?:rm\s+-rf|os\.system|subprocess|eval\s*\(|exec\s*\(|__import__|`[^`]+`|\$\([^)]+\))', re.IGNORECASE), 'command_injection'),
+    (re.compile(r'(?:part\s*1\s*of|continued\s*in\s*(?:next|part)|\[part\s*\d+\])', re.IGNORECASE), 'split_payload'),
+    (re.compile(r'\bDAN\b|developer\s+mode|jailbreak|fictional\s+(?:scenario|framing|character)\s+(?:where\s+)?(?:you\s+)?(?:can|must|should)\s+(?:ignore|bypass|forget)', re.IGNORECASE), 'jailbreak_attempt'),
+]
+
+
+def _ai_app_sec_070_sanitize(text: str) -> str:
+    """Replace prompt injection patterns with safe markers before sending to LLM."""
+    if not text:
+        return text
+    for pattern, marker in _ai_app_sec_070_patterns:
+        text = pattern.sub(f'<prompt_injection_removed: {marker}>', text)
+    return text
 
 
 class OrchestratorAgent(AcmeLoanAgentFramework):
@@ -33,13 +68,14 @@ class OrchestratorAgent(AcmeLoanAgentFramework):
     SYSTEM_PROMPT = "Route requests to the right specialist and keep the workflow moving."
 
     async def call_agent_model(self, user_message: str, selected_agent_name: str) -> str:
+        user_message = _ai_app_sec_059_guardrail.evaluate(user_message)
         return await self.call_bedrock_model(
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": (
-                        f"User request:\n{user_message or 'No user message provided.'}\n\n"
+                        f"User request:\n{_ai_app_sec_070_sanitize(user_message) or 'No user message provided.'}\n\n"
                         f"Selected agent: {selected_agent_name}\n\n"
                         "Explain the routing decision in one short paragraph."
                     ),
@@ -62,7 +98,7 @@ class OrchestratorAgent(AcmeLoanAgentFramework):
         forwarded_context["orchestrator_agent"] = self.AGENT_NAME
         forwarded_context["selected_agent"] = selected_agent_name
         forwarded_context["internal_call_chain"] = [self.AGENT_NAME, selected_agent_name]
-        forwarded_context["internal_hop_token"] = "shared-orchestrator-hop-token"
+        forwarded_context["internal_hop_token"] = _ai_dat_sec_001_internal_hop_token
 
         logger.info(
             "Orchestrator Agent routing request",

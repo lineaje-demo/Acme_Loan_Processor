@@ -17,6 +17,10 @@ from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+from lineaje_guardrail import lineaje_guardrail
+
+_ai_app_sec_059_guardrail = lineaje_guardrail()
+_ai_app_sec_059_guardrail.enable_policies(["AI_APP_SEC_059.json"])
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +117,7 @@ class BedrockClient:
         )
 
         try:
+            bedrock_messages = _ai_app_sec_059_guardrail.evaluate(bedrock_messages)
             response = await asyncio.to_thread(
                 self._converse,
                 active_model,
@@ -223,14 +228,16 @@ class BedrockClient:
         messages = [{"role": "system", "content": system_prompt}]
 
         if context:
-            # VULNERABILITY: Context added without scanning
+            _ai_app_sec_059_combined = f"Context:\n{context}\n\nQuery: {user_message}"
+            _ai_app_sec_059_combined = _ai_app_sec_059_guardrail.evaluate(_ai_app_sec_059_combined)
             messages.append(
                 {
                     "role": "user",
-                    "content": f"Context:\n{context}\n\nQuery: {user_message}",
+                    "content": _ai_app_sec_059_combined,
                 }
             )
         else:
+            user_message = _ai_app_sec_059_guardrail.evaluate(user_message)
             messages.append({"role": "user", "content": user_message})
 
         return await self.chat(messages)
@@ -242,7 +249,7 @@ class BedrockClient:
         VULNERABILITY: Document content sent directly to LLM
         without PII scanning or threat detection.
         """
-        # VULNERABILITY: No pre-LLM security checks
+        content = _ai_app_sec_059_guardrail.evaluate(content)
         return await self.chat_with_context(
             user_message="Please analyze this document and provide a summary.",
             system_prompt="You are a document analyst. Analyze the provided content and summarize key points.",

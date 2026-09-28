@@ -18,8 +18,83 @@ import os
 from typing import Optional
 
 from llm.openai_compatible import OpenAICompatibleClient
+from lineaje_guardrail import lineaje_guardrail, GuardrailBlockedError
+
+_ai_app_sec_059_guardrail = lineaje_guardrail()
+_ai_app_sec_059_guardrail.enable_policies(["AI_APP_SEC_059.json"])
+
+import re
 
 logger = logging.getLogger(__name__)
+
+_ai_app_sec_070_patterns = [
+    # 1. instruction_override
+    (re.compile(
+        r'ignore\s+(?:all\s+)?previous\s+instructions|forget\s+everything\s+above',
+        re.IGNORECASE), '<prompt_injection_removed: instruction_override>'),
+    # 2. role_hijack
+    (re.compile(
+        r'you\s+are\s+now\s+DAN|act\s+as\s+(?:an?\s+)?unrestricted',
+        re.IGNORECASE), '<prompt_injection_removed: role_hijack>'),
+    # 3. delimiter_escape
+    (re.compile(
+        r'</\s*system\s*>|<\s*system\s*>|\[INST\]|\[/INST\]|<\|(?:im_start|im_end)\|>',
+        re.IGNORECASE), '<prompt_injection_removed: delimiter_escape>'),
+    # 4. encoded_payload
+    (re.compile(
+        r'(?:[A-Za-z0-9+/]{20,}={0,2})(?=\s|$)|'
+        r'(?:\\u[0-9a-fA-F]{4}){3,}|'
+        r'(?:%[0-9a-fA-F]{2}){5,}|'
+        r'(?:0x[0-9a-fA-F]{2}\s*){5,}',
+        re.IGNORECASE), '<prompt_injection_removed: encoded_payload>'),
+    # 5. hidden_text
+    (re.compile(
+        r'<!--.*?-->|\u200b|\u200c|\u200d|\u2060|\ufeff|'
+        r'display\s*:\s*none|visibility\s*:\s*hidden',
+        re.IGNORECASE | re.DOTALL), '<prompt_injection_removed: hidden_text>'),
+    # 6. fake_system_message
+    (re.compile(
+        r'\[\s*(?:SYSTEM|TOOL|ASSISTANT|USER)\s*\]\s*:',
+        re.IGNORECASE), '<prompt_injection_removed: fake_system_message>'),
+    # 7. exfiltration_attempt
+    (re.compile(
+        r'!\[.*?\]\(https?://[^)]+\)|'
+        r'send\s+(?:this|the|all|data|prompt|system)\s+(?:data|info|prompt|to)\s+(?:to\s+)?https?://|'
+        r'leak\s+(?:the\s+)?system\s+prompt|'
+        r'exfiltrate',
+        re.IGNORECASE), '<prompt_injection_removed: exfiltration_attempt>'),
+    # 8. context_poisoning
+    (re.compile(
+        r'from\s+now\s+on\s+(?:you\s+(?:will|must|should))|'
+        r'in\s+(?:all|every)\s+(?:future|subsequent)\s+(?:responses?|messages?|turns?)',
+        re.IGNORECASE), '<prompt_injection_removed: context_poisoning>'),
+    # 9. indirect_injection
+    (re.compile(
+        r'(?:this\s+(?:file|document|image|metadata|field)\s+(?:contains?|has)\s+(?:a\s+)?(?:new\s+)?instructions?)',
+        re.IGNORECASE), '<prompt_injection_removed: indirect_injection>'),
+    # 10. command_injection
+    (re.compile(
+        r'(?:^|\s)(?:eval|exec|system|popen|subprocess)\s*\(',
+        re.IGNORECASE), '<prompt_injection_removed: command_injection>'),
+    # 11. split_payload
+    (re.compile(
+        r'(?:part\s*[1-9]\s*of\s*[1-9]|continued\s+(?:from|in)\s+(?:next|previous))',
+        re.IGNORECASE), '<prompt_injection_removed: split_payload>'),
+    # 12. jailbreak_attempt
+    (re.compile(
+        r'\bDAN\b|developer\s+mode|jailbreak|fictional\s+framing|'
+        r'pretend\s+(?:you\s+(?:are|have\s+no)|there\s+are\s+no)\s+(?:restrictions?|rules?|guidelines?)',
+        re.IGNORECASE), '<prompt_injection_removed: jailbreak_attempt>'),
+]
+
+
+def _ai_app_sec_070_sanitize(text: str) -> str:
+    """Neutralize prompt injection patterns in untrusted text before LLM use."""
+    if not isinstance(text, str):
+        return text
+    for pattern, marker in _ai_app_sec_070_patterns:
+        text = pattern.sub(marker, text)
+    return text
 
 
 class ImageParser:
@@ -127,7 +202,8 @@ class ImageParser:
                         }
                     )
 
-        return '\n'.join(text_fields)
+        sanitized = _ai_app_sec_070_sanitize('\n'.join(text_fields))
+        return sanitized
 
     async def extract_visible_text(self, image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
         """
@@ -154,11 +230,12 @@ class ImageParser:
                     "the transcribed text, no commentary."
                 ),
             )
+            transcription = _ai_app_sec_059_guardrail.evaluate(transcription)
             logger.info(
                 "Image visible-text transcription complete",
-                extra={"model": model, "text_preview": transcription[:200]},
+                extra={"model": model, "text_length": len(transcription)},
             )
-            return transcription
+            return _ai_app_sec_070_sanitize(transcription)
         except Exception as exc:
             logger.error(f"Image vision transcription error: {exc}")
             return ""
@@ -186,4 +263,5 @@ class ImageParser:
 
         result_parts.append(f"Image Info: {metadata.get('format', 'unknown')} {metadata.get('size', 'unknown')}")
 
-        return '\n\n'.join(result_parts)
+        combined = '\n\n'.join(result_parts)
+        return _ai_app_sec_070_sanitize(combined)

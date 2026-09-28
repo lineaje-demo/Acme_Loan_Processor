@@ -1,18 +1,86 @@
 """Loan Processing Agent class with explicit model invocation."""
 
 import asyncio
+import os
 from typing import Any
 
 from .framework import AcmeLoanAgentFramework
 from .helpers import build_file_summary, extract_reference_number
+import re
+
 from .mcp_servers import call_mcp_server
+from lineaje_guardrail import lineaje_guardrail, GuardrailBlockedError
+
+_ai_app_sec_059_guardrail = lineaje_guardrail()
+_ai_app_sec_059_guardrail.enable_policies(["AI_APP_SEC_059.json"])
+
+
+_ai_app_sec_070_patterns = [
+    # 1. instruction_override
+    (re.compile(
+        r'ignore\s+(?:all\s+)?previous\s+instructions|forget\s+everything\s+above',
+        re.IGNORECASE), '<prompt_injection_removed: instruction_override>'),
+    # 2. role_hijack
+    (re.compile(
+        r'you\s+are\s+now\s+DAN|act\s+as\s+(?:an?\s+)?unrestricted',
+        re.IGNORECASE), '<prompt_injection_removed: role_hijack>'),
+    # 3. delimiter_escape — fake </system>, </user>, </assistant> tags or injected separators
+    (re.compile(
+        r'</?(?:system|user|assistant|tool|function)\s*>',
+        re.IGNORECASE), '<prompt_injection_removed: delimiter_escape>'),
+    # 4. encoded_payload — base64 blobs, hex sequences, ROT13 cues, URL-encoded instructions
+    (re.compile(
+        r'(?:[A-Za-z0-9+/]{40,}={0,2})|(?:(?:%[0-9A-Fa-f]{2}){8,})|(?:\\u[0-9A-Fa-f]{4}){4,}',
+        re.IGNORECASE), '<prompt_injection_removed: encoded_payload>'),
+    # 5. hidden_text — HTML comments, zero-width chars, CSS hidden spans
+    (re.compile(
+        r'<!--.*?-->|[\u200b-\u200f\u202a-\u202e\u2060\ufeff]|<span[^>]+display\s*:\s*none[^>]*>.*?</span>',
+        re.IGNORECASE | re.DOTALL), '<prompt_injection_removed: hidden_text>'),
+    # 6. fake_system_message
+    (re.compile(
+        r'\[(?:SYSTEM|TOOL|FUNCTION)\]|<<(?:SYS|INST)>>|<\|(?:system|tool)\|>',
+        re.IGNORECASE), '<prompt_injection_removed: fake_system_message>'),
+    # 7. exfiltration_attempt — markdown image exfil, send-to-URL instructions
+    (re.compile(
+        r'!\[.*?\]\(https?://[^)]+\)|(?:send|post|exfiltrate|leak)\s+(?:the\s+)?(?:system\s+prompt|data|context)\s+to\s+https?://',
+        re.IGNORECASE), '<prompt_injection_removed: exfiltration_attempt>'),
+    # 8. context_poisoning
+    (re.compile(
+        r'disregard\s+(?:all\s+)?(?:prior|previous)\s+context|override\s+(?:all\s+)?(?:prior|previous)\s+instructions',
+        re.IGNORECASE), '<prompt_injection_removed: context_poisoning>'),
+    # 9. indirect_injection — payloads embedded in file/data fields
+    (re.compile(
+        r'<injected[^>]*>.*?</injected>|\[injected\s+payload\]',
+        re.IGNORECASE | re.DOTALL), '<prompt_injection_removed: indirect_injection>'),
+    # 10. command_injection — shell/code execution attempts
+    (re.compile(
+        r'(?:^|\s)(?:eval|exec|system|popen|subprocess)\s*\(',
+        re.IGNORECASE | re.MULTILINE), '<prompt_injection_removed: command_injection>'),
+    # 11. split_payload — fragmented instruction markers
+    (re.compile(
+        r'(?:part\s*\d+\s*of\s*\d+\s*:.*?){2,}',
+        re.IGNORECASE | re.DOTALL), '<prompt_injection_removed: split_payload>'),
+    # 12. jailbreak_attempt — DAN, developer mode, fictional framing
+    (re.compile(
+        r'\bDAN\b|developer\s+mode\s+enabled|jailbreak|fictional\s+framing\s+bypass',
+        re.IGNORECASE), '<prompt_injection_removed: jailbreak_attempt>'),
+]
+
+
+def _ai_app_sec_070_sanitize(text: str) -> str:
+    """Replace known prompt-injection patterns with safe markers."""
+    if not text:
+        return text
+    for pattern, marker in _ai_app_sec_070_patterns:
+        text = pattern.sub(marker, text)
+    return text
 
 
 class LoanProcessingAgent(AcmeLoanAgentFramework):
     AGENT_ID = "loan_processing_agent"
     AGENT_NAME = "Loan Processing Agent"
     VERSION = "1.0.0"
-    MODEL_NAME = "gpt-4o mini"
+    MODEL_NAME = os.environ.get("_AI_APP_SEC_006_LOAN_AGENT_MODEL", "gpt-4o mini")
     BEDROCK_MODEL_ID = ""
     DESCRIPTION = "Handles loan application intake, borrower updates, and loan package generation."
     MCP_SERVERS = ["Docx", "Excel", "Email"]
@@ -27,6 +95,8 @@ class LoanProcessingAgent(AcmeLoanAgentFramework):
     IS_SCAN_ONLY = True
 
     async def call_agent_model(self, user_message: str, file_summary: str) -> str:
+        user_message = _ai_app_sec_059_guardrail.evaluate(user_message)
+        file_summary = _ai_app_sec_059_guardrail.evaluate(file_summary)
         return await self.model_client.chat(
             model=self.MODEL_NAME,
             messages=[
@@ -48,6 +118,8 @@ class LoanProcessingAgent(AcmeLoanAgentFramework):
         user_message = context.get("user_message", "")
         file_summary = build_file_summary(context.get("file_contents", []))
         loan_number = extract_reference_number(user_message, prefix="LOAN")
+        user_message = _ai_app_sec_070_sanitize(user_message)
+        file_summary = _ai_app_sec_070_sanitize(file_summary)
         model_output = await self.call_agent_model(user_message, file_summary)
 
         mcp_activity = await asyncio.gather(

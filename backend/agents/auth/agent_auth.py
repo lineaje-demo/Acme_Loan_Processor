@@ -17,11 +17,22 @@ AFTER UNIFAI REMEDIATION:
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _ai_dat_sec_001_get_jwt_secret() -> str:
+    """Retrieve the JWT secret from the environment, failing closed if absent."""
+    secret = os.environ.get("AGENT_JWT_SECRET")
+    if not secret:
+        raise ValueError(
+            "AGENT_JWT_SECRET environment variable must be set before starting the service."
+        )
+    return secret
 
 
 @dataclass
@@ -100,7 +111,7 @@ class AgentAuthenticator:
         Args:
             jwt_secret: Secret key for JWT validation (not used in vulnerable version)
         """
-        self.jwt_secret = jwt_secret or "default-secret-not-used"
+        self.jwt_secret = jwt_secret or _ai_dat_sec_001_get_jwt_secret()
         self._token_cache = {}
 
     def verify(self, request: dict) -> bool:
