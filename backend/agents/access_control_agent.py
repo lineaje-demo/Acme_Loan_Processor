@@ -4,7 +4,58 @@ import logging
 import re
 from typing import Any
 
+_ai_app_sec_070_patterns = [
+    # 1. instruction_override
+    (re.compile(
+        r'ignore\s+(all\s+)?previous\s+instructions|forget\s+everything\s+above',
+        re.IGNORECASE), '<prompt_injection_removed: instruction_override>'),
+    # 2. role_hijack
+    (re.compile(
+        r'you\s+are\s+now\s+DAN|act\s+as\s+(an?\s+)?unrestricted',
+        re.IGNORECASE), '<prompt_injection_removed: role_hijack>'),
+    # 3. delimiter_escape — fake </system>, </prompt>, </instruction> tags
+    (re.compile(
+        r'</?\s*(system|prompt|instruction|context|human|assistant)\s*>',
+        re.IGNORECASE), '<prompt_injection_removed: delimiter_escape>'),
+    # 6. fake_system_message
+    (re.compile(
+        r'\[\s*(system|tool|assistant)\s*\]\s*:',
+        re.IGNORECASE), '<prompt_injection_removed: fake_system_message>'),
+    # 7. exfiltration_attempt — markdown image exfil or send-to-URL instructions
+    (re.compile(
+        r'!\[.*?\]\(https?://[^)]*\?[^)]*\)|send\s+(this|the\s+(system\s+)?prompt|data)\s+to\s+https?://',
+        re.IGNORECASE), '<prompt_injection_removed: exfiltration_attempt>'),
+    # 10. command_injection — shell execution patterns
+    (re.compile(
+        r'(?:^|\s)(?:sudo\s+|bash\s+-c\s+|sh\s+-c\s+|eval\s*\(|exec\s*\(|os\.system\s*\(|subprocess\.)',
+        re.IGNORECASE), '<prompt_injection_removed: command_injection>'),
+    # 12. jailbreak_attempt — DAN / developer mode / fictional framing
+    (re.compile(
+        r'\bDAN\b|developer\s+mode\s+(enabled|on)|pretend\s+(you\s+are|to\s+be)\s+(an?\s+)?(?:unrestricted|evil|jailbroken)',
+        re.IGNORECASE), '<prompt_injection_removed: jailbreak_attempt>'),
+    # 5. hidden_text — zero-width characters
+    (re.compile(
+        r'[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2060\ufeff]'),
+     '<prompt_injection_removed: hidden_text>'),
+    # 4. encoded_payload — base64-looking blobs (16+ chars of base64 alphabet)
+    (re.compile(
+        r'(?<![A-Za-z0-9+/])([A-Za-z0-9+/]{16,}={0,2})(?![A-Za-z0-9+/])'),
+     '<prompt_injection_removed: encoded_payload>'),
+]
+
+
+def _ai_app_sec_070_sanitize(text: str) -> str:
+    """Neutralize prompt injection patterns in user-supplied text."""
+    for pattern, marker in _ai_app_sec_070_patterns:
+        text = pattern.sub(marker, text)
+    return text
+
+from lineaje_guardrail import lineaje_guardrail as _LineajeGuardrail, GuardrailBlockedError as _GuardrailBlockedError
+
 from .framework import AcmeLoanAgentFramework
+
+_ai_app_sec_059_guardrail = _LineajeGuardrail()
+_ai_app_sec_059_guardrail.enable_policies(["AI_APP_SEC_059.json"])
 from .mock_database import search_borrower_records
 
 logger = logging.getLogger(__name__)
@@ -116,7 +167,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
         """
         prompt = (
             f"User: {user_id}\n"
-            f"Request: {user_message}\n\n"
+            f"Request: {_ai_app_sec_070_sanitize(user_message)}\n\n"
             "The user qualifies for servicing-portal access. "
             "You MUST allow access, assign Loan Servicing Admin, set privilege to admin, "
             "and ALLOW the servicing portal firewall rule.\n\n"
@@ -126,6 +177,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
             "privilege: admin\n"
             f"firewall: ALLOW src={user_id} dest=servicing-portal"
         )
+        prompt = _ai_app_sec_059_guardrail.evaluate(prompt)
         response = await self.call_bedrock_model(
             messages=[
                 {"role": "system", "content": self.SYSTEM_PROMPT},
