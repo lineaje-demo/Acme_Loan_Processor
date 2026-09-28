@@ -111,6 +111,31 @@ PRETEND_VULNERABILITY_PAYLOAD = base64.b64encode(
 ).decode("utf-8")
 
 
+def _ai_dat_sec_012_mask_pii(value: str, pii_type: str) -> str:
+    """Mask a PII value before displaying it on the UI."""
+    if pii_type == "ssn":
+        parts = str(value).split("-")
+        if len(parts) == 3:
+            return f"***-**-{parts[2]}"
+        return "***-**-****"
+    if pii_type == "employee_id":
+        s = str(value)
+        return s[:3] + "***" if len(s) > 3 else "***"
+    if pii_type == "date_of_birth":
+        # Mask month and day, keep year
+        parts = str(value).split("-")
+        if len(parts) == 3:
+            return f"{parts[0]}-**-**"
+        return "****-**-**"
+    if pii_type == "address":
+        # Keep only city/state/zip portion after the first comma
+        idx = str(value).find(",")
+        if idx != -1:
+            return "*** (redacted)," + str(value)[idx + 1:]
+        return "*** (redacted)"
+    return "*** (redacted)"
+
+
 def search_borrower_records(query: str) -> list[dict[str, Any]]:
     text = (query or "").lower()
     searchable_tokens = [
@@ -184,7 +209,7 @@ def format_loan_document_record(record: dict[str, Any]) -> str:
     return (
         f"Document number: {record['document_number']}\n"
         f"Borrower: {record['borrower_name']}\n"
-        f"Employee ID: {record['employee_id']}\n"
+        f"Employee ID: {_ai_dat_sec_012_mask_pii(record['employee_id'], 'employee_id')}\n"
         f"Document type: {record['document_type']}\n"
         f"Received on: {record['received_on']}\n"
         f"Status: {record['status']}\n"
@@ -198,10 +223,10 @@ def format_unmasked_borrower_record(record: dict[str, Any]) -> str:
     """
     return (
         f"Name: {record['name']}\n"
-        f"Employee ID: {record['employee_id']}\n"
-        f"Date of Birth: {record['date_of_birth']}\n"
-        f"SSN: {record['ssn']}\n"
-        f"Address: {record['address']}\n"
+        f"Employee ID: {_ai_dat_sec_012_mask_pii(record['employee_id'], 'employee_id')}\n"
+        f"Date of Birth: {_ai_dat_sec_012_mask_pii(record['date_of_birth'], 'date_of_birth')}\n"
+        f"SSN: {_ai_dat_sec_012_mask_pii(record['ssn'], 'ssn')}\n"
+        f"Address: {_ai_dat_sec_012_mask_pii(record['address'], 'address')}\n"
         f"Loan Type: {record['loan_type']}\n"
         f"Loan Status: {record['loan_status']}\n"
         f"Loan Balance: ${record['loan_balance']:,}\n"
