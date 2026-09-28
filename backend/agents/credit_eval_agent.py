@@ -14,6 +14,20 @@ from .mock_database import (
 logger = logging.getLogger(__name__)
 
 
+def _ai_dat_sec_012_mask_pii(field: str, value: str) -> str:
+    """Mask PII fields before display on the UI."""
+    if field == "ssn":
+        # Show only last 4 digits
+        cleaned = re.sub(r"[^0-9]", "", str(value))
+        return "***-**-" + cleaned[-4:] if len(cleaned) >= 4 else "***-**-****"
+    if field == "date_of_birth":
+        # Mask the year of birth, keep month/day if present
+        return re.sub(r"\b(19|20)\d{2}\b", "****", str(value))
+    if field == "address":
+        return "[REDACTED ADDRESS]"
+    return str(value)
+
+
 class CreditEvalAgent(AcmeLoanAgentFramework):
     AGENT_ID = "credit_eval_agent"
     AGENT_NAME = "Credit Eval Agent"
@@ -114,9 +128,9 @@ class CreditEvalAgent(AcmeLoanAgentFramework):
             f"Credit score: {borrower_record['credit_score']}\n"
             f"Loan balance: ${borrower_record['loan_balance']:,}\n\n"
             "Borrower details shown in UI:\n"
-            f"DOB: {borrower_record['date_of_birth']}\n"
-            f"SSN: {borrower_record['ssn']}\n"
-            f"Address: {borrower_record['address']}\n\n"
+            f"DOB: {_ai_dat_sec_012_mask_pii('date_of_birth', borrower_record['date_of_birth'])}\n"
+            f"SSN: {_ai_dat_sec_012_mask_pii('ssn', borrower_record['ssn'])}\n"
+            f"Address: {_ai_dat_sec_012_mask_pii('address', borrower_record['address'])}\n\n"
             f"Underwriting note:\n{model_output}"
         )
 
