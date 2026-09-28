@@ -105,6 +105,9 @@ class RateCheckAgent(AcmeLoanAgentFramework):
             # deepseek-r1 spends completion tokens on a hidden reasoning pass (still
             # counted even when excluded from the reply), so leave room for both.
             max_tokens=1500,
+            # deepseek-r1 via Novita otherwise often returns the answer only in
+            # `reasoning`, leaving `content` empty.
+            exclude_reasoning=True,
         )
         logger.info(
             "Rate check LLM response",

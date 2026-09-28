@@ -62,18 +62,19 @@ class OpenAICompatibleClient:
         messages: list[dict[str, Any]],
         temperature: float = 0.2,
         max_tokens: int = 400,
+        exclude_reasoning: bool = False,
     ) -> str:
-        payload = {
+        payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            # Ask OpenRouter to keep a reasoning model's chain-of-thought out of
-            # the reply. Without this, Novita's deepseek-r1 often puts the whole
-            # answer in `reasoning` and leaves `content` empty. Non-reasoning
-            # models ignore it.
-            "reasoning": {"exclude": True},
         }
+        if exclude_reasoning:
+            # Keep a reasoning model's chain-of-thought out of the reply.
+            # Without this, Novita's deepseek-r1 often puts the whole answer in
+            # `reasoning` and leaves `content` empty.
+            payload["reasoning"] = {"exclude": True}
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
