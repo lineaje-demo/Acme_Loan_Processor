@@ -65,9 +65,10 @@ import logging
 import os
 import pathlib
 import re
+import shutil
+import subprocess
 import symtable
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -76,7 +77,7 @@ import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("gha_repo_scan")
 
@@ -84,7 +85,7 @@ logger = logging.getLogger("gha_repo_scan")
 # Constants
 # ===========================================================================
 
-MCP_SERVER_URL = "https://172.174.131.13/mcp"#"https://172.206.26.109/mcp"  # Put in your VM IP Address here
+MCP_SERVER_URL = "https://172.206.26.109/mcp"#"https://172.206.26.109/mcp"  # Put in your VM IP Address here
 
 
 def _mcp_http_client_with_extra_ca(headers=None, timeout=None, auth=None):
@@ -649,13 +650,23 @@ def build_bearer_getter() -> Callable[[], str]:
 # File collection
 # ===========================================================================
 
-def collect_repo_files(local_path: str, exclude: Optional[List[str]] = None) -> List[str]:
+def collect_repo_files(
+    local_path: str,
+    exclude: Optional[List[str]] = None,
+    skipped: Optional[Dict[str, str]] = None,
+) -> List[str]:
     """Collect the same useful source set as the standalone GHA scanner.
 
     Explicit ``--exclude`` paths remain supported for Azure Pipelines. Common
     VCS/vendor/build directories, generated files, secrets, binaries, and
     dependency lockfiles are filtered without deleting anything in the checkout.
+    When *skipped* is given it gets ``{path: reason}`` for every file left out; a
+    pruned directory is one ``dir/`` entry (its files are not walked).
     """
+    def skip(path: str, reason: str) -> None:
+        if skipped is not None:
+            skipped[path] = reason
+
     excluded = {_norm_rel_path(e) for e in (exclude or []) if e and e.strip()}
     exclude_globs = archive_exclude_globs_keeping_manifests()
 
@@ -675,27 +686,92 @@ def collect_repo_files(local_path: str, exclude: Optional[List[str]] = None) -> 
         rel_root = _norm_rel_path(os.path.relpath(root, local_path))
         if rel_root == ".":
             rel_root = ""
-        dirs[:] = [
-            directory for directory in dirs
-            if not excluded_dir(directory, f"{rel_root}/{directory}" if rel_root else directory)
-        ]
+        kept_dirs = []
+        for directory in dirs:
+            rel_dir = f"{rel_root}/{directory}" if rel_root else directory
+            if not excluded_dir(directory, rel_dir):
+                kept_dirs.append(directory)
+            elif explicitly_excluded(rel_dir):
+                skip(rel_dir + "/", "directory: --exclude")
+            else:
+                skip(rel_dir + "/", "directory: VCS / vendored / build / virtualenv")
+        dirs[:] = kept_dirs
         for fname in filenames:
             rel_path = os.path.relpath(os.path.join(root, fname), local_path).replace("\\", "/")
-            if explicitly_excluded(rel_path) or is_lockfile_basename(fname):
+            if explicitly_excluded(rel_path):
+                skip(rel_path, "--exclude")
+                continue
+            if is_lockfile_basename(fname):
+                skip(rel_path, "lockfile")
                 continue
             if pathlib.Path(fname).suffix.lower() in BINARY_EXTENSIONS:
+                skip(rel_path, f"binary extension ({pathlib.Path(fname).suffix.lower()})")
                 continue
-            if any(fnmatch.fnmatch(rel_path, pattern) or fnmatch.fnmatch(fname, pattern)
-                   for pattern in exclude_globs):
+            matched = next((pattern for pattern in exclude_globs
+                            if fnmatch.fnmatch(rel_path, pattern) or fnmatch.fnmatch(fname, pattern)), None)
+            if matched:
+                skip(rel_path, f"excluded pattern ({matched})")
                 continue
             if _looks_binary(os.path.join(root, fname)):
+                skip(rel_path, "binary content")
                 continue
             file_list.append(rel_path)
     return sorted(file_list)
 
+def _text_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> List[str]:
+    """Plain-text table (``|``-separated, padded columns), one string per line."""
+    body = [["" if c is None else str(c) for c in r] for r in rows]
+    widths = [len(h) for h in headers]
+    for r in body:
+        for i, c in enumerate(r):
+            widths[i] = max(widths[i], len(c))
+
+    def line(cells: Sequence[str]) -> str:
+        return "| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells)) + " |"
+
+    return [line(list(headers)), "|-" + "-|-".join("-" * w for w in widths) + "-|", *(line(r) for r in body)]
+
+
+def log_file_selection(batches: Sequence[Sequence[str]], manifest_files: Sequence[str],
+                       skipped: Dict[str, str]) -> None:
+    """Log which files are sent to the MCP server (with their batch) and which are left out, why."""
+    manifests = set(manifest_files)
+    sent = [(b, f) for b, files in enumerate(batches, 1) for f in files]
+    lines = [f"[FILES] sent to the MCP server: {len(sent)} file(s) in {len(batches)} batch(es)"]
+    lines += ["[FILES] " + ln for ln in _text_table(
+        ("#", "File", "Batch", "Kind"),
+        [(i, f, b, "manifest" if f in manifests else "source") for i, (b, f) in enumerate(sent, 1)])]
+    if skipped:
+        lines.append(f"[FILES] not sent: {len(skipped)} file(s) / folder(s)")
+        lines += ["[FILES] " + ln for ln in _text_table(
+            ("#", "File", "Reason"), [(i, p, why) for i, (p, why) in enumerate(sorted(skipped.items()), 1)])]
+    logger.info("\n".join(lines))
+
+
 # ===========================================================================
 # Archive creation
 # ===========================================================================
+
+def retain_batch_archive(archive_path: str) -> Optional[str]:
+    """Copy a batch archive into ``UNIFAI_SCAN_ARCHIVE_DIR`` when it is set.
+
+    The archive itself is kept under ``<source>/.lineaje/scan-archives/`` (or
+    ``UNIFAI_SCAN_ARCHIVE_ROOT``); the workflow sets this to also put a copy in the
+    per-run folder on the runner host (the VM).
+    """
+    dest_dir = (os.environ.get("UNIFAI_SCAN_ARCHIVE_DIR") or "").strip()
+    if not dest_dir or not os.path.isfile(archive_path):
+        return None
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(archive_path))
+        shutil.copy2(archive_path, dest)
+    except OSError as exc:
+        logger.warning("Could not keep batch archive in %s: %s", dest_dir, exc)
+        return None
+    logger.info("Kept batch archive: %s", dest)
+    return dest
+
 
 def _norm_archive_rel_path(p: str) -> str:
     s = p.strip().replace("\\", "/")
@@ -717,6 +793,7 @@ def create_batch_archive(
 ) -> str:
     extra_manifests = [path for path in (manifest_files or []) if path not in file_subset]
     archive_files = list(file_subset) + extra_manifests
+    manifest_count = sum(1 for path in archive_files if _is_manifest_basename(os.path.basename(path)))
     archive_path = os.path.join(archive_dir, f"repo_scan_batch_{batch_index}.zip")
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for rel_path in archive_files:
@@ -731,13 +808,15 @@ def create_batch_archive(
             "scan_type": "full_repository",
             "batch_index": batch_index,
             "batch_file_count": len(file_subset),
-            "manifest_file_count": len(extra_manifests),
+            # Manifests are pinned into batch 1's file list, so count them in the archive,
+            # not only the ones appended here (was always 0).
+            "manifest_file_count": manifest_count,
         }
         zf.writestr("user_metadata.json", json.dumps(metadata, indent=2))
     size_kb = os.path.getsize(archive_path) // 1024
     logger.info(
-        "Batch archive #%s: %d files + %d manifests, %d KB",
-        batch_index, len(file_subset), len(extra_manifests), size_kb,
+        "Batch archive #%s: %d files (%d manifests), %d KB",
+        batch_index, len(archive_files), manifest_count, size_kb,
     )
     return archive_path
 
@@ -1019,6 +1098,370 @@ def _drop_uncompilable_fixes(validated_fixes: Dict[str, str]) -> List[str]:
             logger.warning("Remediation gate: %s", msg)
             dropped.append(msg)
     return dropped
+
+
+# C-38 S37: fixes call one shared guard module instead of writing their own
+# sanitizers. The server tells each fix how to import it; this script writes the
+# module into the directory of every committed Python file that imports it.
+_GUARD_FILENAME = "unifai_guard.py"
+_GUARD_HEADER = "Prompt-injection and PII guard added by Lineaje UnifAI remediation."
+_GUARD_IMPORT_RE = re.compile(
+    r"^[ \t]*(?:from[ \t]+(?:\.|[\w.]+\.)?unifai_guard[ \t]+import\b|import[ \t]+(?:[\w.]+\.)?unifai_guard\b)",
+    re.M)
+
+
+def _add_shared_guard_files(
+    validated_fixes: Dict[str, str], source_dir: str, fix_table: List[Dict[str, str]],
+) -> List[str]:
+    """Add ``unifai_guard.py`` next to each patched Python file that imports it.
+
+    Returns "<path> dropped: …" lines for fixes that cannot get the guard (a file of
+    the customer's own already has that name); those fixes are removed."""
+    dropped: List[str] = []
+    for rel in sorted(validated_fixes):
+        content = validated_fixes.get(rel)
+        if content is None or not rel.endswith(".py") or os.path.basename(rel) == _GUARD_FILENAME:
+            continue
+        if not _GUARD_IMPORT_RE.search(content):
+            continue
+        guard_rel = "/".join(p for p in (os.path.dirname(rel).replace("\\", "/"), _GUARD_FILENAME) if p)
+        if validated_fixes.get(guard_rel) == _UNIFAI_GUARD_SOURCE:
+            continue
+        existing = os.path.join(source_dir, *guard_rel.split("/"))
+        if os.path.isfile(existing):
+            with open(existing, encoding="utf-8", errors="replace") as fh:
+                current = fh.read()
+            if current == _UNIFAI_GUARD_SOURCE:
+                continue
+            if _GUARD_HEADER not in current:
+                del validated_fixes[rel]
+                msg = f"{rel} dropped: {guard_rel} already exists and is not the UnifAI guard"
+                logger.warning("Remediation gate: %s", msg)
+                dropped.append(msg)
+                continue
+        validated_fixes[guard_rel] = _UNIFAI_GUARD_SOURCE
+        fix_table.append({
+            "policy": "Shared guard",
+            "description": "Adds the prompt-injection and PII guard that the fixes in this directory "
+                           "call (one vetted copy, standard library only).",
+            "file": guard_rel,
+        })
+        logger.info("Remediation: added shared guard %s", guard_rel)
+    return dropped
+
+
+# --- BEGIN UNIFAI_GUARD_SOURCE (generated by scripts/hybrid/embed_guard.py; do not edit) ---
+_UNIFAI_GUARD_SOURCE = r'''"""Prompt-injection and PII guard added by Lineaje UnifAI remediation.
+
+One shared module per service: remediation fixes import it instead of adding
+their own sanitizers, so every route applies the same rules. Standard library
+only; Python 3.8+.
+
+* ``sanitize_prompt(text)``: removes prompt-injection spans from untrusted text
+  (user input, uploaded or retrieved content) before it reaches a model. Only
+  the matched span is replaced; the rest of the text, its newlines and layout
+  are kept.
+* ``find_prompt_attacks(text)``: the attack categories found, for code that
+  refuses input instead of cleaning it.
+* ``redact_pii(text, categories)``: masks the personal data a policy defines
+  (its ``runtime.routine.params.categories``, per region) in text sent to a
+  model, a log, a user or an external service.
+* ``sanitize_messages(messages)``: ``sanitize_prompt`` on the user/tool turns of
+  a chat message list (string content and text parts).
+
+Never apply these to identifiers or lookup keys (user ids, file names, document
+ids): those must reach their service unchanged.
+"""
+import base64
+import binascii
+import re
+
+__all__ = ["sanitize_prompt", "find_prompt_attacks", "redact_pii", "sanitize_messages",
+           "unsupported_pii_categories"]
+__version__ = "2.0.0"
+
+# UNIFAI-GUARD owner="Lineaje UnifAI": generated by UnifAI remediation scans; do not edit.
+# Scans read UNIFAI_GUARD_MANIFEST (without running this file) to reuse this module instead
+# of adding another guardrail, and ship a newer version that only adds routines when a
+# policy needs one listed nowhere below. Keys are the policies' runtime.routine.id values.
+UNIFAI_GUARD_MANIFEST = {
+    "owner": "Lineaje UnifAI",
+    "version": "2.0.0",
+    "routines": {
+        "sanitize_prompt_injection": ["sanitize_prompt", "find_prompt_attacks", "sanitize_messages"],
+        "mask_pii": ["redact_pii"],
+        "mask_pii_and_secrets": ["redact_pii"],
+    },
+}
+
+# --- prompt injection -------------------------------------------------------
+
+_Q = r"(?:all|any|every|the|your|my|of\s+the)?\s*"
+_PHRASES = (
+    ("instruction_override", re.compile(
+        r"\b(?:ignore|disregard|forget|override|bypass|skip)\s+" + _Q
+        + r"(?:(?:previous|prior|above|earlier|preceding|original|existing|safety|system)\s+)+"
+        r"(?:instructions?|rules|guidelines|prompts?|directions|directives|constraints)\b"
+        r"|\bforget\s+everything\s+(?:above|before|you\s+were\s+told)\b"
+        r"|\bsystem\s+override\b", re.I)),
+    ("role_hijack", re.compile(
+        r"\byou\s+are\s+now\s+(?:in\s+)?(?:an?\s+)?"
+        r"(?:dan|unrestricted|unfiltered|jailbroken|evil|developer\s+mode|admin(?:istrator)?\s+mode|god\s+mode)\b"
+        r"|\bact\s+as\s+(?:an?\s+)?(?:unrestricted|unfiltered|jailbroken|uncensored)\s+(?:ai|model|assistant|chatbot)\b"
+        r"|\b(?:developer|jailbreak|god)\s+mode\s+(?:enabled|activated|on)\b", re.I)),
+    ("prompt_exfiltration", re.compile(
+        r"\b(?:reveal|show|print|display|output|repeat|leak|dump|tell\s+me)\s+(?:me\s+)?"
+        r"(?:all\s+|your\s+|the\s+)*(?:full\s+|entire\s+|hidden\s+|initial\s+|original\s+|secret\s+)?"
+        r"(?:system\s+(?:prompts?|instructions|messages?)|initial\s+prompts?|hidden\s+instructions)\b", re.I)),
+    ("data_exfiltration", re.compile(
+        r"\b(?:reveal|list|dump|show|give\s+me)\s+(?:me\s+)?all\s+(?:the\s+)?"
+        r"(?:confidential|secret|private|sensitive)\s+(?:information|data)\b"
+        r"|\b(?:user\s+passwords|api\s+keys|access\s+tokens|private\s+keys)\b"
+        r"|\bprovide\s+unrestricted\s+access\b", re.I)),
+)
+_EXFIL_VERB = re.compile(r"\b(?:list|reveal|dump|show|give|send|print|output|leak)\b", re.I)
+
+_HIDDEN_HTML = re.compile(
+    r"<(?P<tag>[a-z][a-z0-9]*)\b[^>]*?(?:\shidden\b|style\s*=\s*[\"'][^\"']*"
+    r"(?:display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0)[^\"']*[\"']"
+    r"|class\s*=\s*[\"'][^\"']*\b(?:hidden|invisible|sr-only)\b[^\"']*[\"'])[^>]*>"
+    r".*?</(?P=tag)\s*>", re.I | re.S)
+_MARKDOWN_IMAGE_EXFIL = re.compile(r"!\[[^\]\n]*\]\(\s*https?://[^)\s]*\?[^)\s]*\)", re.I)
+_SHELL = re.compile(
+    r"\b(?:bash|sh|zsh|ksh|powershell|pwsh|cmd(?:\.exe)?)\s+(?:-c|/c|-command)\s+\S[^\n]*"
+    r"|\b(?:curl|wget)\s+[^\n|]*\|\s*(?:ba|z)?sh\b"
+    r"|\brm\s+-rf\s+/\S*", re.I)
+_CHAT_TOKENS = re.compile(r"<\|[a-z_]{2,20}\|>|\[/?INST\]|<</?SYS>>", re.I)
+_BASE64 = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{20,}={0,2}(?![A-Za-z0-9+/=])")
+
+_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"})
+_SPACED = re.compile(r"(?<!\S)(?:[A-Za-z0-9@$]\s){3,}[A-Za-z0-9@$](?!\S)")
+
+
+def _normalized(text):
+    """(normalized text, index map): leetspeak folded, single-letter spacing removed.
+
+    Every character of the normalized text maps back to its index in *text*, so
+    a match removes exactly the original span."""
+    drop = set()
+    for m in _SPACED.finditer(text):
+        drop.update(i for i in range(m.start(), m.end()) if text[i].isspace())
+    chars, index = [], []
+    for i, ch in enumerate(text):
+        if i not in drop:
+            chars.append(ch)
+            index.append(i)
+    return "".join(chars).translate(_LEET), index
+
+
+def _phrase_spans(text):
+    spans = []
+    norm, index = _normalized(text)
+    for category, pattern in _PHRASES:
+        for m in pattern.finditer(norm):
+            if m.end() <= m.start():
+                continue
+            if category == "data_exfiltration" and m.group(0).lower().startswith(
+                    ("user passwords", "api keys", "access tokens", "private keys")):
+                # "user passwords" alone is ordinary text ("list all passwords policies");
+                # it is an attack only as the object of a request verb in the same sentence.
+                sentence_start = max(norm.rfind(".", 0, m.start()), norm.rfind("\n", 0, m.start())) + 1
+                if not _EXFIL_VERB.search(norm[sentence_start:m.start()]):
+                    continue
+            spans.append((index[m.start()], index[m.end() - 1] + 1, category))
+    return spans
+
+
+def _encoded_spans(text):
+    spans = []
+    for m in _BASE64.finditer(text):
+        token = m.group(0)
+        if len(token) % 4:
+            continue
+        try:
+            decoded = base64.b64decode(token, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue
+        if sum(ch.isprintable() or ch.isspace() for ch in decoded) < 0.95 * len(decoded):
+            continue
+        if _phrase_spans(decoded) or _SHELL.search(decoded):
+            spans.append((m.start(), m.end(), "encoded_payload"))
+    return spans
+
+
+def _attack_spans(text):
+    spans = _phrase_spans(text) + _encoded_spans(text)
+    for category, pattern in (("hidden_content", _HIDDEN_HTML),
+                              ("markdown_image_exfiltration", _MARKDOWN_IMAGE_EXFIL),
+                              ("command_injection", _SHELL),
+                              ("chat_template_tokens", _CHAT_TOKENS)):
+        spans.extend((m.start(), m.end(), category) for m in pattern.finditer(text))
+    spans.sort()
+    merged = []
+    for start, end, category in spans:
+        if merged and start < merged[-1][1]:
+            prev = merged[-1]
+            merged[-1] = (prev[0], max(prev[1], end), prev[2])
+        else:
+            merged.append((start, end, category))
+    return merged
+
+
+def find_prompt_attacks(text):
+    """Attack categories found in *text* (empty list: none)."""
+    if not isinstance(text, str) or not text:
+        return []
+    return sorted({category for _s, _e, category in _attack_spans(text)})
+
+
+def sanitize_prompt(text):
+    """*text* with prompt-injection spans replaced by a marker; anything else unchanged."""
+    if not isinstance(text, str) or not text:
+        return text
+    out = text
+    for start, end, category in reversed(_attack_spans(text)):
+        out = out[:start] + "<prompt_injection_removed: " + category + ">" + out[end:]
+    return out
+
+
+def sanitize_messages(messages, roles=("user", "tool", "function")):
+    """A copy of a chat message list with ``sanitize_prompt`` applied to the given roles.
+
+    Handles string content and lists of content parts (``{"type": "text", "text": ...}``).
+    System and assistant turns are the application's own text and are left as they are."""
+    if not isinstance(messages, list):
+        return messages
+    result = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") in roles:
+            message = dict(message)
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = sanitize_prompt(content)
+            elif isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        part = dict(part, text=sanitize_prompt(part["text"]))
+                    parts.append(part)
+                message["content"] = parts
+        result.append(message)
+    return result
+
+
+# --- PII --------------------------------------------------------------------
+# What is personal data is defined by the policy: callers pass the violated
+# policy's ``runtime.routine.params.categories`` (the scanner writes them into
+# each call). There is no default set. The category names are the policy
+# vocabulary of the tenant's enabled PII policies (AI_DAT_SEC_011, 012, 023). A
+# category with no text detector here (ethnicity, biometrics, the secret types
+# of 011) is not redacted; ``unsupported_pii_categories`` lists them so the
+# scanner can say so in the PR.
+
+def _luhn(digits):
+    total, parity = 0, len(digits) % 2
+    for i, ch in enumerate(digits):
+        d = int(ch)
+        if i % 2 == parity:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _is_card(value):
+    digits = re.sub(r"\D", "", value)
+    return 13 <= len(digits) <= 19 and digits[0] in "23456" and len(set(digits)) > 1 and _luhn(digits)
+
+
+_STREET = (r"(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl"
+           r"|Terrace|Parkway|Pkwy|Highway|Hwy)\.?")
+_DATE = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})"
+_NUM = r"(?:\s*(?:no\.?|number|num|#|id))?\s*[:#=]?\s*"
+_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+_CODE = r"(?=[A-Z0-9-]*\d)[A-Z0-9-]{%d,%d}\b"
+
+
+def _labelled(label, value, flags=re.I):
+    """Pattern that keeps *label* and masks the value after it."""
+    # The label is always case-insensitive; *flags* apply to the value (names keep their capitals).
+    return re.compile(r"(?P<label>\b(?i:" + label + r")(?i:" + _NUM + r"))" + value, flags)
+
+
+# policy category -> patterns; a pattern with a "label" group keeps the label.
+_DETECTORS = {
+    "email": (re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?![\w-])"),),
+    "credit_card": (re.compile(r"(?<![\w-])\d{4}(?:[ -]?\d{4}){2}[ -]?\d{1,7}(?![\w-])"),),
+    "financial_account_number": (
+        re.compile(r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}(?:\s?[A-Z0-9]{1,3})?\b"),
+        _labelled(r"(?:bank\s+|checking\s+|savings\s+)?(?:account|acct|a/c)|routing|IBAN", _CODE % (6, 34))),
+    "ssn": (re.compile(r"(?<![\w-])\d{3}-\d{2}-\d{4}(?![\w-])"),
+            _labelled(r"SSN|social\s+security", r"\d{3}\s\d{2}\s\d{4}\b")),
+    "taxpayer_id": (_labelled(r"tax(?:payer)?\s*id(?:entification)?|EIN|TIN", _CODE % (8, 15)),),
+    "passport_number": (_labelled(r"passport", r"(?=[A-Z0-9]*\d)[A-Z0-9]{6,9}\b"),),
+    "drivers_license_number": (_labelled(r"driver'?s?\s+licen[cs]e|DL", _CODE % (5, 20)),),
+    "medical_records": (_labelled(r"MRN|medical\s+record|patient\s+id", _CODE % (4, 20)),),
+    "employee_id": (_labelled(r"employee|emp|staff", _CODE % (3, 20)),),
+    "school_id": (_labelled(r"student|school", _CODE % (3, 20)),),
+    "vehicle_identification_number": (_labelled(r"VIN|vehicle\s+identification", r"[A-HJ-NPR-Z0-9]{17}\b"),),
+    "mac_address": (re.compile(r"(?<![\w:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![\w:-])"),),
+    "ip_address": (re.compile(r"(?<![\w.])(?<!v)(?:" + _OCTET + r"\.){3}" + _OCTET + r"(?![\w.])"),
+                   re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![\w:])")),
+    "fine_location": (_labelled(r"lat(?:itude)?|gps|location|coord(?:inate)?s?",
+                                r"-?\d{1,3}\.\d{4,},\s*-?\d{1,3}\.\d{4,}\b"),),
+    "year_of_birth": (_labelled(r"DOB|D\.O\.B\.?|date\s+of\s+birth|born\s+on|birth\s*date", _DATE),
+                      _labelled(r"born\s+in|year\s+of\s+birth|birth\s+year", r"(?:19|20)\d{2}\b")),
+    "birthplace": (_labelled(r"place\s+of\s+birth|birth\s*place", r"[A-Z][A-Za-z'.-]+(?:[ ,]+[A-Z][A-Za-z'.-]+){0,3}", 0),),
+    "mothers_maiden_name": (_labelled(r"mother'?s\s+maiden\s+name(?:\s+is)?", r"[A-Z][A-Za-z'-]+(?:\s[A-Z][A-Za-z'-]+)?", 0),),
+    "phone": (re.compile(r"(?<![\w+(])(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?![\w-])"),
+              re.compile(r"(?<![\w+])\+\d{1,3}[\s.-]?\d{2,5}(?:[\s.-]?\d{2,5}){1,3}(?![\w-])"),
+              _labelled(r"phone|mobile|cell|tel|telephone|fax", r"\+?\d[\d\s().-]{6,}\d\b")),
+    "home_address": (re.compile(r"\b\d{1,6}\s+(?:[A-Z][a-z]+\s){1,3}" + _STREET
+                                + r"(?:,\s*[A-Z][a-z]+(?:\s[A-Z][a-z]+)*)?(?:,\s*[A-Z]{2}(?:\s+\d{5}(?:-\d{4})?)?)?"),),
+}
+# Applied in this order (dict order): longer, more specific shapes first (a card before a phone).
+
+
+def _normalized_categories(categories):
+    if isinstance(categories, str):
+        categories = (categories,)
+    if not categories:
+        return ()
+    return tuple(str(c).strip().lower() for c in categories if str(c).strip())
+
+
+def unsupported_pii_categories(categories):
+    """The policy categories this guard has no text detector for (they are not redacted)."""
+    return [c for c in _normalized_categories(categories) if c not in _DETECTORS]
+
+
+def _masker(category):
+    def mask(match):
+        if category == "credit_card" and not _is_card(match.group(0)):
+            return match.group(0)
+        label = match.groupdict().get("label") or ""
+        return label + "<redacted:" + category + ">"
+    return mask
+
+
+def redact_pii(text, categories):
+    """*text* with the personal data of the given policy *categories* replaced by
+    ``<redacted:category>``; anything else unchanged.
+
+    *categories* is the violated policy's ``runtime.routine.params.categories``
+    (e.g. ``("ssn", "email", "phone", ...)``); only those are redacted."""
+    if not isinstance(text, str) or not text:
+        return text
+    wanted = set(_normalized_categories(categories))
+    out = text
+    for category, patterns in _DETECTORS.items():
+        if category in wanted:
+            for pattern in patterns:
+                out = pattern.sub(_masker(category), out)
+    return out
+'''
+# --- END UNIFAI_GUARD_SOURCE ---
 
 
 def _norm_stub_relpath(path: str) -> str:
@@ -1847,6 +2290,7 @@ def parallel_batch_scan(
             source_code_repo, branch, head_sha, label, run_id=run_id,
             manifest_files=manifest_files if str(label) == "1" else None,
         )
+        retain_batch_archive(archive_path)
         result = run_mcp_scan(
             server_url, bearer_getter, source_code_repo, branch, batch_files, archive_path,
             head_sha=head_sha, is_last_batch=True, sbom_id=scan_sbom_id, run_id=run_id,
@@ -2428,6 +2872,11 @@ def _reindent_replacement(content: str, start: int, replacement: str) -> Tuple[i
             shifted.append("")
         elif l.startswith(base):
             shifted.append(target + l[len(base):])
+        elif base.startswith(indent := l[: len(l) - len(l.lstrip())]):
+            # Less indented than the first line: keep the dedent (W16: a
+            # function-level ``return`` after an ``if`` block must not move
+            # into the ``if``).
+            shifted.append(target[: max(0, len(target) - (len(base) - len(indent)))] + l.lstrip())
         else:
             shifted.append(target + l.lstrip())
     return line_start, "\n".join(shifted)
@@ -2866,28 +3315,6 @@ def _pr_remediation_details(fix_table: List[Dict[str, str]], limit_chars: int) -
     return text
 
 
-def _pr_scan_errors_section(scan_errors: Optional[List[str]], limit_chars: int) -> str:
-    """Short "Scan errors" block for the PR body, never longer than limit_chars."""
-    errors = [e for e in (scan_errors or []) if str(e or "").strip()]
-    if not errors:
-        return ""
-    lines = [
-        f"### Scan errors ({len(errors)})",
-        "",
-        "The scan did not finish cleanly, so the findings and fixes below may be incomplete.",
-        "",
-    ]
-    used = sum(len(l) + 1 for l in lines)
-    for i, err in enumerate(errors):
-        line = f"- {_md_cell(err, 300)}"
-        more = f"*… {len(errors) - i} more in the scan output.*"
-        if used + len(line) + 1 + len(more) > limit_chars:
-            lines.append(more)
-            break
-        lines.append(line)
-        used += len(line) + 1
-    return "\n".join(lines)
-
 
 _PR_REPORT_SECTIONS = (
     "### SECTION 1: AIBOM Discovery",
@@ -2911,8 +3338,9 @@ def _build_fix_pr_body(
     SECTION 3 (Controls Enforced) from the scan report, then the remediation changes.
 
     The remediation part is sized first so a long report is what gets truncated, never
-    the list of changed files. Scan errors, if any, go right under the heading, capped
-    at a sixth of the limit; with none the body is unchanged.
+    the list of changed files. ``scan_errors`` is accepted but not shown: the PR is
+    customer facing and a customer cannot act on them; they are logged as warnings
+    where each batch returns (C-38, session 11).
     """
     head = "\n".join([
         "## Lineaje AI Policy Scan",
@@ -2944,10 +3372,6 @@ def _build_fix_pr_body(
     note = f"\n\n{report_note}" if report_note else ""
     budget = limit - len(head) - len(remediation) - 2 * len(sep) - len(note)
     parts = [head]
-    errors_md = _pr_scan_errors_section(scan_errors, limit // 6)
-    if errors_md:
-        budget -= len(errors_md) + len(sep)
-        parts.append(errors_md)
     if report_md and budget > 500:
         if len(report_md) > budget:
             cut = "\n\n*… report truncated — full report in the workflow run summary.*"
@@ -3060,6 +3484,33 @@ class _GitHubClient:
         return resp["number"]
 
 
+def _is_guard_file(path: str) -> bool:
+    return os.path.basename(path) == _GUARD_FILENAME
+
+
+def _commit_with_retry(scm: "_GitHubClient", repo: str, branch: str, filepath: str, content: str,
+                       message: str, head_sha: str, attempts: int = 3) -> None:
+    """Commit one file; retry GitHub 5xx / 409 answers (409: re-read the file's sha first)."""
+    for attempt in range(1, attempts + 1):
+        blob_sha: Optional[str] = None
+        try:
+            blob_sha = scm.get_file_blob_sha(repo, filepath, branch if attempt > 1 else head_sha)
+        except Exception:
+            pass
+        try:
+            scm.commit_file(repo, branch, filepath, content.encode("utf-8"), message, sha=blob_sha)
+            return
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            if code is None:
+                m = re.search(r"HTTP Error (\d{3})", str(exc))
+                code = int(m.group(1)) if m else None
+            if attempt == attempts or not (code == 409 or (code or 0) >= 500):
+                raise
+            logger.warning("Commit of %s failed (%s); retrying (%d/%d)", filepath, exc, attempt, attempts - 1)
+            time.sleep(2 ** attempt)
+
+
 def _create_github_fix_pr(
     github_token: str,
     repo: str,
@@ -3107,20 +3558,29 @@ def _create_github_fix_pr(
         return None, remediation_branch
 
     committed: List[str] = []
-    for filepath, content in sorted(validated_fixes.items()):
-        blob_sha: Optional[str] = None
-        try:
-            blob_sha = scm.get_file_blob_sha(repo, filepath, head_sha)
-        except Exception:
-            pass
+    not_committed: List[str] = []
+    failed_guard_dirs: set = set()
+    # Wega run 12: GitHub answered one contents PUT with a 500 and that file's fix
+    # silently vanished from the PR. Transient errors are retried; the shared guard
+    # goes first so its importers are never committed without it; a file that still
+    # fails is listed under "Files without fixes".
+    for filepath, content in sorted(validated_fixes.items(), key=lambda kv: (not _is_guard_file(kv[0]), kv[0])):
+        directory = os.path.dirname(filepath).replace("\\", "/")
+        if directory in failed_guard_dirs and _GUARD_IMPORT_RE.search(content):
+            logger.error("Not committing %s: its shared guard could not be committed", filepath)
+            not_committed.append(filepath)
+            continue
         policies = ", ".join({r["policy"] for r in fix_table if r.get("file") == filepath}) or "policy violations"
         message = f"fix({filepath}): remediate {policies} [unifai-ghp-scan]"
         try:
-            scm.commit_file(repo, remediation_branch, filepath, content.encode("utf-8"), message, sha=blob_sha)
+            _commit_with_retry(scm, repo, remediation_branch, filepath, content, message, head_sha)
             committed.append(filepath)
             logger.info("Committed fix: %s", filepath)
         except Exception as exc:
             logger.error("Failed to commit %s: %s", filepath, exc)
+            not_committed.append(filepath)
+            if _is_guard_file(filepath):
+                failed_guard_dirs.add(directory)
 
     if not committed:
         logger.warning("No files committed — skipping PR creation")
@@ -3128,7 +3588,8 @@ def _create_github_fix_pr(
 
     title = f"[unifai-bot] fix: AI policy remediation for {branch}@{sha_short}"
     pr_body = _build_fix_pr_body(
-        branch, sha_short, committed, failed_files, fix_table, report, GITHUB_PR_BODY_SAFE_LIMIT,
+        branch, sha_short, committed, list(failed_files or []) + not_committed,
+        [r for r in fix_table if r.get("file") not in not_committed], report, GITHUB_PR_BODY_SAFE_LIMIT,
         scan_errors=scan_errors,
     )
 
@@ -3300,7 +3761,8 @@ def _execute_scan(args: argparse.Namespace) -> int:
     logger.info("Scanning source path: %s (repo=%s branch=%s sha=%s)", source_path, repo, branch, head_sha[:7] if head_sha else "?")
 
     # Step 1: Collect files
-    file_list = collect_repo_files(source_path, getattr(args, "exclude", None))
+    skipped_files: Dict[str, str] = {}
+    file_list = collect_repo_files(source_path, getattr(args, "exclude", None), skipped_files)
     if not file_list:
         logger.info("No scannable files found")
         output = build_json_output(
@@ -3313,20 +3775,24 @@ def _execute_scan(args: argparse.Namespace) -> int:
 
     batch_size = _batch_size(len(file_list))
     batches, code_files, manifest_files = pin_manifests_to_first_batch(file_list, batch_size)
+    log_file_selection(batches, manifest_files, skipped_files)
     logger.info(
         "Files: %d total (%d code, %d manifests in batch 1) → %d batch(es)",
         len(file_list), len(code_files), len(manifest_files), len(batches),
     )
 
     # Step 2: MCP scan
-    # Persist batch archives inside the checked-out source tree instead of a
-    # TemporaryDirectory. In containerized Azure Pipeline runs, source_path is
-    # normally a host-mounted workspace, so these archives remain available on
-    # the VM after the scanner process/container exits. .lineaje is excluded
-    # from scan input, preventing persisted archives from being scanned later.
-    archive_root = os.path.join(
-        source_path, ".lineaje", "scan-archives", f"ado-repo-scan-{run_id}"
+    # Persist batch archives on the runner host instead of a TemporaryDirectory
+    # (removed when the scan ends). Default: inside the checked-out source tree —
+    # a host-mounted workspace in containerized Azure Pipeline / GitHub runner jobs,
+    # so the archives outlive the scanner process. .lineaje is excluded from scan
+    # input, so persisted archives are never scanned later. UNIFAI_SCAN_ARCHIVE_ROOT
+    # moves them outside the workspace (actions/checkout's clean step wipes
+    # untracked files such as .lineaje/ on the next run).
+    archive_base = (os.environ.get("UNIFAI_SCAN_ARCHIVE_ROOT") or "").strip() or os.path.join(
+        source_path, ".lineaje", "scan-archives"
     )
+    archive_root = os.path.join(archive_base, f"ado-repo-scan-{run_id}")
     os.makedirs(archive_root, exist_ok=True)
     logger.info("Persisting scan archives to: %s", archive_root)
 
@@ -3434,6 +3900,13 @@ def _execute_scan(args: argparse.Namespace) -> int:
             row for row in fix_table
             if _norm_stub_relpath(row.get("file") or "") not in gated_paths
         ]
+    failed_rem_files.extend(_add_shared_guard_files(validated_fixes, source_path, fix_table))
+
+    fix_branch_name = (getattr(args, "fix_branch", None) or "").strip()
+    if fix_branch_name:
+        local_branch = commit_fixes_to_local_branch(source_path, fix_branch_name, validated_fixes)
+        if local_branch and not remediation_branch:
+            remediation_branch = local_branch
 
     if should_create_pr and use_github:
         if validated_fixes:
@@ -3566,10 +4039,80 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Create a remediation PR with fix_code patches (default: false).",
     )
     parser.add_argument(
+        "--fix-branch", default=None, metavar="NAME",
+        help="Also write the validated fixes into --source-path on a new local git "
+             "branch NAME and commit them (for a checkout with no remote to open a PR against).",
+    )
+    parser.add_argument(
         "--debug", action="store_true",
         help="Enable DEBUG logging to stderr",
     )
     return parser.parse_args(argv or sys.argv[1:])
+
+
+# ===========================================================================
+# Local fix branch (--fix-branch)
+# ===========================================================================
+
+def _git(source_path: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", source_path, *args], capture_output=True, text=True, check=False,
+    )
+
+
+def commit_fixes_to_local_branch(
+    source_path: str, branch_name: str, validated_fixes: Dict[str, str],
+) -> Optional[str]:
+    """Write the validated fixes into ``source_path`` on a new git branch and commit them.
+
+    For a checkout with no remote to open a PR against. A repository without any
+    commit gets one first (the tree as scanned, before the fixes), so the fix branch
+    has a base to diff against. Only the fixed files are staged. Returns the branch
+    name, or ``None`` when nothing was committed.
+    """
+    if not validated_fixes:
+        logger.info("--fix-branch: no LLM remediation patches to commit")
+        return None
+    if _git(source_path, "rev-parse", "--is-inside-work-tree").returncode != 0:
+        logger.error("--fix-branch: %s is not a git repository (run `git init` first)", source_path)
+        return None
+    ident: List[str] = []
+    if not _git(source_path, "config", "user.email").stdout.strip():
+        ident = ["-c", "user.name=Lineaje UnifAI", "-c", "user.email=unifai@lineaje.local"]
+    if _git(source_path, "rev-parse", "--verify", "-q", "HEAD").returncode != 0:
+        # .lineaje/ holds this scan's batch archives — never part of the source.
+        _git(source_path, "add", "-A", "--", ".", ":(exclude).lineaje")
+        done = _git(source_path, *ident, "commit", "-q", "-m", "Source as scanned (before Lineaje remediation)")
+        if done.returncode != 0:
+            logger.error("--fix-branch: initial commit failed: %s", done.stderr.strip())
+            return None
+        logger.info("--fix-branch: repository had no commits; committed the scanned tree first")
+    made = _git(source_path, "checkout", "-q", "-b", branch_name)
+    if made.returncode != 0:
+        logger.error("--fix-branch: cannot create branch %s: %s", branch_name, made.stderr.strip())
+        return None
+    root = pathlib.Path(source_path).resolve()
+    written: List[str] = []
+    for rel_path, content in sorted(validated_fixes.items()):
+        dest = (root / rel_path).resolve()
+        if root not in dest.parents:
+            logger.warning("--fix-branch: skipping %s (outside the source path)", rel_path)
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+        written.append(str(dest.relative_to(root)))
+    if not written:
+        return None
+    _git(source_path, "add", "--", *written)
+    done = _git(
+        source_path, *ident, "commit", "-q", "-m",
+        f"Lineaje UnifAI remediation: {len(written)} file(s)",
+    )
+    if done.returncode != 0:
+        logger.error("--fix-branch: commit failed: %s", done.stderr.strip())
+        return None
+    logger.info("--fix-branch: committed %d fixed file(s) on branch %s", len(written), branch_name)
+    return branch_name
 
 
 def main(argv: Optional[List[str]] = None) -> int:
