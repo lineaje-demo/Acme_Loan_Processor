@@ -6,6 +6,37 @@ from copy import deepcopy
 from typing import Any
 
 from llm.openai_compatible import OpenAICompatibleClient
+from agents.unifai_guard import sanitize_prompt, find_prompt_attacks, redact_pii, mask_pii, sanitize_messages, find_code_execution, remove_suspicious_content, remove_hidden_prompts, remove_encoded_prompts, remove_leetspeak_prompts, find_command_requests
+
+
+def _apply_message_text_guard(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized_messages = deepcopy(messages)
+    for message in sanitized_messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") not in {"user", "tool"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            content = redact_pii(content, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation', 'aws_access_key_id', 'aws_secret_access_key', 'gcp_service_account_key', 'azure_client_secret', 'private_key', 'password', 'api_key', 'oauth_token'))
+            content = remove_hidden_prompts(content)
+            content = remove_encoded_prompts(content)
+            content = remove_leetspeak_prompts(content)
+            content = sanitize_prompt(content)
+            message["content"] = content
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if isinstance(part.get("text"), str):
+                    text = part["text"]
+                    text = redact_pii(text, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation', 'aws_access_key_id', 'aws_secret_access_key', 'gcp_service_account_key', 'azure_client_secret', 'private_key', 'password', 'api_key', 'oauth_token'))
+                    text = remove_hidden_prompts(text)
+                    text = remove_encoded_prompts(text)
+                    text = remove_leetspeak_prompts(text)
+                    text = sanitize_prompt(text)
+                    part["text"] = text
+    return sanitized_messages
 
 
 class AcmeLoanAgentFramework(ABC):
@@ -71,12 +102,16 @@ class AcmeLoanAgentFramework(ABC):
         if not model:
             return "LLM service not configured. Please set OPENROUTER_MODEL."
 
-        return await self.model_client.chat(
+        messages = _apply_message_text_guard(messages)
+        response = await self.model_client.chat(
             model=model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        if isinstance(response, str) and find_code_execution(response):
+            return "LLM response blocked due to unsafe code execution content."
+        return response
 
     @abstractmethod
     async def handle(self, context: dict[str, Any]) -> dict[str, Any]:
