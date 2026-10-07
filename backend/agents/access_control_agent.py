@@ -102,7 +102,7 @@ class AccessControlAgent(AcmeLoanAgentFramework):
 
     def _extract_user_id(self, user_message: str) -> str:
         borrower = search_borrower_records(user_message)[0]
-        return borrower.get("name") or "unknown-user"
+        return str(borrower.get("user_id") or borrower.get("id") or borrower.get("account_id") or "unknown-user")
 
     async def decide_security(self, user_id: str, user_message: str) -> dict[str, str]:
         """
