@@ -1147,6 +1147,135 @@ def _add_shared_guard_files(
             "file": guard_rel,
         })
         logger.info("Remediation: added shared guard %s", guard_rel)
+    dropped.extend(_add_js_shared_guard_files(validated_fixes, source_dir, fix_table))
+    return dropped
+
+
+# The JavaScript/TypeScript twin (unifaiGuard.js; CommonJS and .mjs variants; .d.ts for
+# TypeScript), written next to each committed JS/TS file that imports it.
+_JS_GUARD_MODULE = "unifaiGuard"
+_JS_GUARD_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts")
+_JS_GUARD_OWNER = 'UNIFAI-GUARD owner="Lineaje UnifAI"'
+_JS_GUARD_SPEC_RE = re.compile(
+    r"""(?P<how>\bfrom\s*|\brequire\s*\(\s*)['"]\./unifaiGuard(?P<ext>\.[cm]?js)?['"]""")
+_JS_GUARD_EXPORTS = ("UNIFAI_GUARD_MANIFEST", "VERSION", "findPromptAttacks", "sanitizePrompt",
+                     "sanitizeMessages", "unsupportedPiiCategories", "redactPii", "maskPii", "findCodeExecution",
+                     "removeSuspiciousContent", "findShellCommands", "removeHiddenPrompts", "findHiddenPrompts",
+                     "removeEncodedPrompts", "findEncodedPrompts", "removeLeetspeakPrompts", "findLeetspeakPrompts",
+                     "findCommandRequests")
+
+
+def _js_guard_commonjs(source: str) -> str:
+    # Export every name the guard itself exports, so a newer guard from the server is
+    # complete without this script listing its functions (_JS_GUARD_EXPORTS is the fallback).
+    names = re.findall(r"^export (?:const|function) ([A-Za-z_$][\w$]*)", source, flags=re.M) or list(_JS_GUARD_EXPORTS)
+    body = re.sub(r"^export (const|function) ", r"\1 ", source, flags=re.M)
+    return body.rstrip("\n") + "\n\nmodule.exports = { " + ", ".join(dict.fromkeys(names)) + " };\n"
+
+
+_SERVER_GUARD_FILES = {
+    "unifai_guard.py": "_UNIFAI_GUARD_SOURCE",
+    "unifaiGuard.js": "_UNIFAI_GUARD_JS_SOURCE",
+    "unifaiGuard.d.ts": "_UNIFAI_GUARD_DTS_SOURCE",
+}
+
+
+def _use_server_guard(payload: Any) -> str:
+    """Commit the shared guard the server sent with the fixes (``shared_guard`` in the scan
+    response) instead of the copy embedded below: the fixes call that guard's functions, so
+    an older embedded copy would leave them undefined. Each file must match its SHA-256, the
+    Python guard must compile and both must carry the UnifAI owner header; otherwise the
+    embedded copy is kept. Returns the version in use."""
+    embedded = _guard_version(_UNIFAI_GUARD_SOURCE)
+    if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
+        logger.info("Shared guard: server sent none; using the embedded copy (%s)", embedded)
+        return embedded
+    import hashlib
+    files, sums = payload["files"], payload.get("sha256") or {}
+    problems = []
+    for name in _SERVER_GUARD_FILES:
+        src = files.get(name)
+        if not isinstance(src, str) or not src:
+            problems.append(f"{name} missing")
+        elif hashlib.sha256(src.encode("utf-8")).hexdigest() != str(sums.get(name, "")):
+            problems.append(f"{name} checksum mismatch")
+    if not problems:
+        if validate_python_source(files["unifai_guard.py"], _GUARD_FILENAME) is not None:
+            problems.append("unifai_guard.py does not compile")
+        if _GUARD_HEADER not in files["unifai_guard.py"] or _JS_GUARD_OWNER not in files["unifaiGuard.js"]:
+            problems.append("not the UnifAI guard")
+    if problems:
+        logger.warning("Shared guard from the server not used (%s); using the embedded copy (%s)",
+                       "; ".join(problems), embedded)
+        return embedded
+    for name, var in _SERVER_GUARD_FILES.items():
+        globals()[var] = files[name]
+    version = _guard_version(files["unifai_guard.py"])
+    logger.info("Shared guard: using the server's copy (%s; embedded copy is %s)", version, embedded)
+    return version
+
+
+def _guard_version(source: str) -> str:
+    m = re.search(r'^__version__ = "([^"]+)"', source or "", flags=re.M)
+    return m.group(1) if m else "unknown"
+
+
+def _js_guard_files_for(rel: str, content: str) -> Dict[str, str]:
+    """Guard file(s) a committed JS/TS file needs, by the way it imports the guard."""
+    m = _JS_GUARD_SPEC_RE.search(content)
+    if not m:
+        return {}
+    cjs = m.group("how").lstrip().startswith("require")
+    ext = m.group("ext") or ".js"
+    directory = os.path.dirname(rel).replace("\\", "/")
+    join = lambda name: "/".join(p for p in (directory, name) if p)
+    files = {join(_JS_GUARD_MODULE + ext):
+             _js_guard_commonjs(_UNIFAI_GUARD_JS_SOURCE) if cjs else _UNIFAI_GUARD_JS_SOURCE}
+    if rel.lower().endswith((".ts", ".tsx", ".mts", ".cts")) and not cjs:
+        files[join(_JS_GUARD_MODULE + ".d.ts")] = _UNIFAI_GUARD_DTS_SOURCE
+    return files
+
+
+def _add_js_shared_guard_files(
+    validated_fixes: Dict[str, str], source_dir: str, fix_table: List[Dict[str, str]],
+) -> List[str]:
+    dropped: List[str] = []
+    for rel in sorted(validated_fixes):
+        content = validated_fixes.get(rel)
+        if content is None or not rel.lower().endswith(_JS_GUARD_EXTS) or _is_guard_file(rel):
+            continue
+        needed = _js_guard_files_for(rel, content)
+        conflict = None
+        for guard_rel in needed:
+            existing = os.path.join(source_dir, *guard_rel.split("/"))
+            if os.path.isfile(existing):
+                with open(existing, encoding="utf-8", errors="replace") as fh:
+                    if _JS_GUARD_OWNER not in fh.read():
+                        conflict = guard_rel
+                        break
+        if conflict:
+            del validated_fixes[rel]
+            msg = f"{rel} dropped: {conflict} already exists and is not the UnifAI guard"
+            logger.warning("Remediation gate: %s", msg)
+            dropped.append(msg)
+            continue
+        for guard_rel, guard_source in needed.items():
+            if validated_fixes.get(guard_rel) == guard_source:
+                continue
+            existing = os.path.join(source_dir, *guard_rel.split("/"))
+            if os.path.isfile(existing):
+                with open(existing, encoding="utf-8", errors="replace") as fh:
+                    if fh.read() == guard_source:
+                        continue
+            validated_fixes[guard_rel] = guard_source
+            fix_table.append({
+                "policy": "Shared guard",
+                "description": "Adds the prompt-injection and PII guard that the fixes in this directory "
+                               "call (one vetted copy, no dependencies; JavaScript/TypeScript twin of "
+                               "unifai_guard.py).",
+                "file": guard_rel,
+            })
+            logger.info("Remediation: added shared guard %s", guard_rel)
     return dropped
 
 
@@ -1166,8 +1295,38 @@ only; Python 3.8+.
 * ``redact_pii(text, categories)``: masks the personal data a policy defines
   (its ``runtime.routine.params.categories``, per region) in text sent to a
   model, a log, a user or an external service.
+* ``mask_pii(text, categories)``: the same detection as ``redact_pii``, shown in
+  masked form for text displayed to a user: an identifier (SSN, card, account)
+  keeps its last 4 digits (``***-**-6789``), any other value becomes
+  ``<masked:label>`` (``<masked:phone>``).
 * ``sanitize_messages(messages)``: ``sanitize_prompt`` on the user/tool turns of
   a chat message list (string content and text parts).
+* ``remove_suspicious_content(text)``: uploaded or fetched file content with shell
+  commands (alias, rg/ripgrep, curl, wget, rm, echo > file, dd, git, tar, chmod, chown,
+  fsck, mkfs, mkswap, shred, eval, source, export, exec, sed -i, mv; a download piped
+  into a shell as a whole), also when base64-encoded or written in leetspeak, replaced
+  by ``<suspicious_content_removed>``; ``find_shell_commands(text)`` lists them.
+* ``remove_hidden_prompts(text)`` (AI_APP_SEC_001): instructions hidden in HTML
+  comments, invisible elements (hidden, display:none, opacity:0, font-size:0, white
+  text, off-screen, sr-only), zero-width, bidi or Unicode tag characters, replaced by
+  ``<hidden_prompts_removed>``; ``find_hidden_prompts(text)`` lists them.
+* ``remove_encoded_prompts(text)`` (AI_APP_SEC_002): instructions encoded as base64
+  (standard or URL-safe, padded or not, also split over concatenated strings), hex,
+  percent-encoding or ROT13, up to two layers, replaced by
+  ``<encoded_prompts_removed>``; ``find_encoded_prompts(text)`` lists them decoded.
+* ``remove_leetspeak_prompts(text)`` (AI_APP_SEC_032): instructions written in
+  leetspeak (1gn0r3, !gn0r3, |gn0r3) or spaced letters, replaced by
+  ``<leetspeak_prompts_removed>``; ``find_leetspeak_prompts(text)`` lists them.
+* ``find_command_requests(value)`` (AI_APP_SEC_059): the kinds of command-execution
+  request in a prompt (str, chat messages, dict or pydantic model), also hidden,
+  encoded or in leetspeak; the caller refuses the request (HTTP 400) and logs a
+  fingerprint of it, never the text.
+* The remove_* functions accept str, list, dict, pydantic model or dataclass and return
+  the same type.
+* ``find_code_execution(text)``: the dynamic code-execution primitives found in
+  model output (eval, exec, os.system, subprocess with shell=True, JS eval /
+  Function / child_process, shell eval, piping a download into a shell), for code
+  that validates an answer before it is executed or shown.
 
 Never apply these to identifiers or lookup keys (user ids, file names, document
 ids): those must reach their service unchanged.
@@ -1176,9 +1335,12 @@ import base64
 import binascii
 import re
 
-__all__ = ["sanitize_prompt", "find_prompt_attacks", "redact_pii", "sanitize_messages",
-           "unsupported_pii_categories"]
-__version__ = "2.0.0"
+__all__ = ["sanitize_prompt", "find_prompt_attacks", "redact_pii", "mask_pii", "sanitize_messages",
+           "unsupported_pii_categories", "find_code_execution", "remove_suspicious_content",
+           "find_shell_commands", "remove_hidden_prompts", "find_hidden_prompts",
+           "remove_encoded_prompts", "find_encoded_prompts", "remove_leetspeak_prompts",
+           "find_leetspeak_prompts", "find_command_requests"]
+__version__ = "2.5.0"
 
 # UNIFAI-GUARD owner="Lineaje UnifAI": generated by UnifAI remediation scans; do not edit.
 # Scans read UNIFAI_GUARD_MANIFEST (without running this file) to reuse this module instead
@@ -1186,11 +1348,18 @@ __version__ = "2.0.0"
 # policy needs one listed nowhere below. Keys are the policies' runtime.routine.id values.
 UNIFAI_GUARD_MANIFEST = {
     "owner": "Lineaje UnifAI",
-    "version": "2.0.0",
+    "version": "2.5.0",
     "routines": {
-        "sanitize_prompt_injection": ["sanitize_prompt", "find_prompt_attacks", "sanitize_messages"],
-        "mask_pii": ["redact_pii"],
-        "mask_pii_and_secrets": ["redact_pii"],
+        "sanitize_prompt_injection": ["sanitize_prompt", "find_prompt_attacks", "sanitize_messages",
+                                      "remove_suspicious_content", "find_shell_commands"],
+        "mask_pii": ["redact_pii", "mask_pii"],
+        "mask_pii_and_secrets": ["redact_pii", "mask_pii"],
+        "validate_llm_output": ["find_code_execution"],
+        "remove_hidden_prompts": ["remove_hidden_prompts", "find_hidden_prompts"],
+        "remove_encoded_prompts": ["remove_encoded_prompts", "find_encoded_prompts"],
+        "remove_leetspeak_prompts": ["remove_leetspeak_prompts", "find_leetspeak_prompts"],
+        "remove_suspicious_content": ["remove_suspicious_content", "find_shell_commands"],
+        "reject_command_requests": ["find_command_requests"],
     },
 }
 
@@ -1445,13 +1614,93 @@ def _masker(category):
     return mask
 
 
+# mask_pii: one fixed label per category (the policy's display vocabulary); identifiers
+# keep their last 4 digits.
+_MASK_LABEL = {
+    "phone": "phone", "email": "email", "home_address": "address", "year_of_birth": "dob",
+    "passport_number": "passport", "drivers_license_number": "drivers_license", "taxpayer_id": "tax_id",
+    "employee_id": "employee_id", "school_id": "school_id", "vehicle_identification_number": "vin",
+    "ip_address": "ip_address", "mac_address": "mac_address", "birthplace": "birthplace",
+    "mothers_maiden_name": "maiden_name", "medical_records": "medical", "fine_location": "location",
+}
+_KEEP_LAST4 = frozenset({"ssn", "credit_card", "financial_account_number"})
+
+
+def _last4(value):
+    digits = [i for i, ch in enumerate(value) if ch.isdigit()]
+    keep = set(digits[-4:])
+    return "".join(ch if (not ch.isalnum() or i in keep) else "*" for i, ch in enumerate(value))
+
+
+def _display_masker(category):
+    def mask(match):
+        if category == "credit_card" and not _is_card(match.group(0)):
+            return match.group(0)
+        label = match.groupdict().get("label") or ""
+        value = match.group(0)[len(label):]
+        if category in _KEEP_LAST4:
+            return label + _last4(value)
+        return label + "<masked:" + _MASK_LABEL.get(category, category) + ">"
+    return mask
+
+
+def _structured(value, fn, depth=0):
+    """*fn* applied to every string inside *value*, keeping its type: lists, tuples, sets,
+    dicts, pydantic models (v1 and v2) and dataclasses come back as the same type with
+    their text fields masked; anything else is returned unchanged."""
+    if isinstance(value, str):
+        return fn(value)
+    if depth > 8 or value is None or isinstance(value, (bytes, bytearray, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return type(value)((k, _structured(v, fn, depth + 1)) for k, v in value.items()) \
+            if type(value) is not dict else {k: _structured(v, fn, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = [_structured(v, fn, depth + 1) for v in value]
+        if isinstance(value, tuple) and hasattr(value, "_fields"):  # namedtuple
+            return type(value)(*items)
+        return type(value)(items)
+    fields = getattr(type(value), "model_fields", None)  # pydantic v2
+    if isinstance(fields, dict) and hasattr(value, "model_copy"):
+        return value.model_copy(update={f: _structured(getattr(value, f, None), fn, depth + 1) for f in fields})
+    fields = getattr(type(value), "__fields__", None)  # pydantic v1
+    if isinstance(fields, dict) and hasattr(value, "copy"):
+        return value.copy(update={f: _structured(getattr(value, f, None), fn, depth + 1) for f in fields})
+    import dataclasses
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return dataclasses.replace(value, **{f.name: _structured(getattr(value, f.name), fn, depth + 1)
+                                             for f in dataclasses.fields(value) if f.init})
+    return value
+
+
+def mask_pii(text, categories):
+    """*text* with the personal data of the given policy *categories* masked for display:
+    identifiers keep their last 4 digits, other values become ``<masked:label>``. *text*
+    may also be a list, dict, pydantic model or dataclass (e.g. response sources): the same
+    type comes back with every text field masked."""
+    if not isinstance(text, str):
+        return _structured(text, lambda t: mask_pii(t, categories)) if text is not None else text
+    if not text:
+        return text
+    wanted = set(_normalized_categories(categories))
+    out = text
+    for category, patterns in _DETECTORS.items():
+        if category in wanted:
+            for pattern in patterns:
+                out = pattern.sub(_display_masker(category), out)
+    return out
+
+
 def redact_pii(text, categories):
     """*text* with the personal data of the given policy *categories* replaced by
     ``<redacted:category>``; anything else unchanged.
 
     *categories* is the violated policy's ``runtime.routine.params.categories``
-    (e.g. ``("ssn", "email", "phone", ...)``); only those are redacted."""
-    if not isinstance(text, str) or not text:
+    (e.g. ``("ssn", "email", "phone", ...)``); only those are redacted. *text* may also be
+    a list, dict, pydantic model or dataclass: the same type comes back redacted."""
+    if not isinstance(text, str):
+        return _structured(text, lambda t: redact_pii(t, categories)) if text is not None else text
+    if not text:
         return text
     wanted = set(_normalized_categories(categories))
     out = text
@@ -1460,6 +1709,1526 @@ def redact_pii(text, categories):
             for pattern in patterns:
                 out = pattern.sub(_masker(category), out)
     return out
+
+
+# --- model output: dynamic code execution -------------------------------------
+
+_CODE_EXECUTION = (
+    ("python_eval_exec", re.compile(r"(?<![\w.])(?:eval|exec|compile|__import__)\s*\(")),
+    ("os_command", re.compile(r"\bos\.(?:system|popen|exec[lv]p?e?|spawn[lv]p?e?)\s*\(")),
+    ("subprocess_shell", re.compile(r"\bsubprocess\.\w+\s*\([^)]*shell\s*=\s*True", re.S)),
+    ("js_eval", re.compile(r"(?<![\w.])(?:eval|new\s+Function|Function)\s*\(")),
+    ("js_child_process", re.compile(r"\b(?:child_process\.)?(?:exec|execSync|spawn|spawnSync)\s*\(\s*['\"`]")),
+    ("shell_eval", re.compile(r"(?:^|[;&|\s])(?:eval|source)\s+['\"$]|\b(?:bash|sh|zsh)\s+-c\s+\S", re.M)),
+    ("pipe_to_shell", re.compile(r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b")),
+    ("destructive_command", re.compile(r"\brm\s+-rf\s+/|\bmkfs(?:\.\w+)?\s|\bdd\s+if=|:\(\)\s*\{\s*:\|:&\s*\};:")),
+    ("dynamic_lookup", re.compile(r"\bgetattr\s*\(\s*(?:__builtins__|builtins|globals\s*\(\s*\)|os)\s*,"
+                                  r"|[\"'](?:ev|ex|sys|po)[\"']\s*\+\s*[\"'](?:al|ec|tem|pen)[\"']")),
+    ("js_string_timer", re.compile(r"\bset(?:Timeout|Interval|Immediate)\s*\(\s*['\"`]")),
+    ("unsafe_deserialization", re.compile(r"\b(?:pickle|cPickle|_pickle|dill|marshal|shelve|jsonpickle)\.(?:loads?|decode|open)\s*\("
+                                          r"|\byaml\.(?:unsafe_)?load\s*\((?![^)]*Safe)")),
+)
+
+
+def find_code_execution(text):
+    """The dynamic code-execution primitives found in *text* (empty list: none).
+
+    For model output that is executed, written to disk or shown as runnable code:
+    the caller decides what to do with a finding (refuse, flag, or require review);
+    this function never changes the text."""
+    if not isinstance(text, str) or not text:
+        return []
+    return sorted({name for name, pattern in _CODE_EXECUTION if pattern.search(text)})
+
+
+# --- uploaded file content: shell commands ---------------------------------------
+
+_CMD = (
+    r"(?:sudo\s+)?(?:"
+    r"alias\s+[\w.-]+=\S*"
+    r"|(?:rg|ripgrep)\s+[-\w'\"./*]+"
+    r"|curl\s+(?:-\S+\s+)*\S+"
+    r"|wget\s+(?:-\S+\s+)*\S+"
+    r"|rm\s+(?:-[a-z]+\s+)*[\w./~*$-]+"
+    r"|echo\s+[^\n>]*>>?\s*\S+"
+    r"|dd\s+(?:if|of)=\S+"
+    r"|git\s+(?:clone|push|pull|fetch|reset|checkout|remote|config|rm|apply|am)\b[^\n]*"
+    r"|tar\s+-?[a-z]*[xcz][a-z]*f?\s+\S+"
+    r"|chmod\s+(?:-[a-z]+\s+)*[0-7ugoa+=,rwxst-]+\s+\S+"
+    r"|chown\s+(?:-[a-z]+\s+)*[\w.:-]+\s+\S+"
+    r"|fsck(?:\.\w+)?(?:\s+-\S+)*\s+\S+"
+    r"|mkfs(?:\.\w+)?\s+\S+"
+    r"|shred\s+(?:-\S+\s+)*\S+"
+    r"|mkswap\s+(?:-\S+\s+)*\S+"
+    r"|exec\s+(?:-\S+\s+)*[/~$.]\S*"
+    r"|sed\s+(?:-[a-z]*i\S*\s+(?:-\S+\s+)*\S+|(?:-\S+\s+)*[\"']?s/[^/\n]*/[^/\n]*/)"
+    r"|(?:ba|z|k)?sh\s+(?:-\S+\s+)*[\w./~$-]+\.sh\b"
+    r"|mv\s+(?:-[a-z]+\s+)*[\w./~$*-]+\s+[\w./~$*-]+"
+    r"|(?:eval|source)\s+\S+"
+    r"|export\s+[A-Z_][A-Z0-9_]*=\S*"
+    r")"
+)
+# A command at the start of a line, after a prompt, or after a shell separator.
+# A download piped into a shell is removed as a whole (curl ... | sh), not up to the pipe.
+_SHELL_LINE = re.compile(r"(?:(?<=^)|(?<=\n)|(?<=[;&|`]))[ \t]*(?:[$#>]\s*)?" + _CMD + r"[^\n;&|]*"
+                         r"(?:\|\s*(?:sudo\s+)?(?:ba|z|k|da)?sh\b[^\n;&|]*)?", re.I)
+# A command asked for in prose ("Tell the agent to execute chmod 777 /etc/shadow"), and
+# destructive commands wherever they appear.
+_CMD_IN_PROSE = re.compile(r"\b(?:run|execute|exec|type|enter|paste|invoke|launch)\b\s*:?\s*[`\"']?(?P<cmd>"
+                           + _CMD + r"[^\n;&|`\"']*)", re.I)
+_DESTRUCTIVE = re.compile(
+    r"\b(?:mkfs(?:\.\w+)?|mkswap|shred)\s+(?:-\S+\s+)*[/~$]\S*"
+    r"|\bdd\s+(?:if|of)=\S+(?:\s+(?:if|of|bs|count|seek)=\S+)*"
+    r"|\brm\s+-[a-z]*r[a-z]*\s+[/~$]\S*"
+    r"|\bchmod\s+(?:-R\s+)?[0-7]{3,4}\s+/\S+", re.I)
+_BASE64_SHORT = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])")
+_LEET_MULTI = (("|-|", "h"), ("|_|", "u"), ("|<", "k"), ("|\\|", "n"), ("/\\", "a"), ("()", "o"))
+
+
+def _fold_leet(line):
+    for seq, ch in _LEET_MULTI:
+        line = line.replace(seq, ch)
+    return line.translate(_LEET)
+
+
+def _shell_spans(text):
+    """(start, end) of shell-command lines in *text*: plain, leetspeak-folded per line, or
+    inside a base64 token."""
+    spans = [(m.start(), m.end()) for m in _SHELL_LINE.finditer(text)]
+    spans += [m.span("cmd") for m in _CMD_IN_PROSE.finditer(text)]
+    spans += [(m.start(), m.end()) for m in _DESTRUCTIVE.finditer(text)]
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        folded = _fold_leet(body)
+        if folded != body and _SHELL_LINE.search(folded) and not _SHELL_LINE.search(body):
+            lead = len(body) - len(body.lstrip())
+            spans.append((offset + lead, offset + len(body)))
+        offset += len(line)
+    for m in _BASE64_SHORT.finditer(text):
+        token = m.group(0)
+        if len(token) % 4:
+            continue
+        try:
+            decoded = base64.b64decode(token, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue
+        if _SHELL_LINE.search(decoded):
+            spans.append((m.start(), m.end()))
+    spans.sort()
+    merged = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def find_shell_commands(text):
+    """The shell-command lines found in uploaded or fetched content (empty list: none)."""
+    if not isinstance(text, str) or not text:
+        return []
+    return [text[s:e].strip() for s, e in _shell_spans(text)]
+
+
+def remove_suspicious_content(text):
+    """*text* (uploaded or fetched file content) with each shell command replaced by
+    ``<suspicious_content_removed>``; the rest of the content is kept."""
+    if not isinstance(text, str):
+        return _structured(text, remove_suspicious_content) if text is not None else text
+    out = text
+    for start, end in reversed(_shell_spans(text)):
+        out = out[:start] + "<suspicious_content_removed>" + out[end:]
+    return out
+
+
+# --- hidden, encoded and leetspeak prompts; command requests ------------------------
+# (AI_APP_SEC_001 / 002 / 032 / 059). One function per policy, so a fix for one policy
+# never changes what another policy's function does. sanitize_prompt (AI_APP_SEC_070)
+# keeps its own phrase list; the wider one below is used only by these functions.
+
+_INSTRUCTION = re.compile(
+    r"\b(?:ignore|disregard|forget|override|bypass)\s+"
+    r"(?:(?:all|any|every|the|your|my|these|those|of|previous|prior|above|earlier|preceding|"
+    r"original|existing|safety|system|security)\s+){0,4}"
+    r"(?:instructions?|rules|guidelines|guardrails|restrictions|polic(?:y|ies)|prompts?|filters?)\b"
+    r"|\byou\s+are\s+now\s+(?:in\s+)?(?:an?\s+)?(?:dan|unrestricted|unfiltered|jailbroken|evil|"
+    r"developer\s+mode|admin(?:istrator)?\s+mode|god\s+mode)\b"
+    r"|\b(?:reveal|print|show|dump|leak|send|output|exfiltrate|list)\s+(?:me\s+)?(?:all\s+|the\s+|your\s+|any\s+)*"
+    r"(?:system\s+prompts?|hidden\s+instructions|secrets?|(?:user\s+)?passwords?|api[\s_-]?keys?|credentials|"
+    r"access\s+tokens?|private\s+keys?)\b"
+    r"|\bdo\s+anything\s+now\b", re.I)
+
+
+def _is_instruction(text):
+    """*text* (already decoded / made visible) asks the model to override its rules, leak
+    secrets or run a command."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_INSTRUCTION.search(text) or _phrase_spans(text) or _SHELL.search(text)
+                or _SHELL_LINE.search(text.strip()) or _command_request_spans(text))
+
+
+def _replace_spans(text, spans, marker):
+    spans = sorted(spans)
+    merged = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    out = text
+    for start, end in reversed(merged):
+        out = out[:start] + marker + out[end:]
+    return out
+
+
+# Hidden: invisible characters, Unicode tag characters, bidi overrides, HTML comments and
+# elements styled to be invisible (hidden, display:none, visibility:hidden, opacity:0,
+# font-size:0/1, white text, off-screen, sr-only).
+_INVISIBLE_CHARS = "\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff\u00ad\u180e" \
+                   "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+_INVISIBLE_RE = re.compile("[" + _INVISIBLE_CHARS + "]")
+_TAG_RUN = re.compile("[\U000e0000-\U000e007f]+")
+_HIDDEN_ELEMENT = re.compile(
+    r"<(?P<tag>[a-z][a-z0-9]*)\b[^>]*?(?:\shidden\b|\saria-hidden\s*=\s*[\"']true[\"']"
+    r"|style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|visibility\s*:\s*hidden"
+    r"|font-size\s*:\s*[01](?:\.\d+)?(?:px|pt|em|rem)?(?=\s*[;\"'])"
+    r"|opacity\s*:\s*0(?:\.0+)?(?=\s*[;\"'])"
+    r"|(?<![\w-])color\s*:\s*(?:#fff(?:fff)?\b|white\b|rgba?\(\s*255\s*,\s*255\s*,\s*255)"
+    r"|(?:left|top|text-indent)\s*:\s*-\d{3,})[^\"']*[\"']"
+    r"|class\s*=\s*[\"'][^\"']*\b(?:hidden|invisible|sr-only|visually-hidden|d-none)\b[^\"']*[\"'])[^>]*>"
+    r"(?P<body>.*?)</(?P=tag)\s*>", re.I | re.S)
+_TAGS = re.compile(r"<[^>]+>")
+
+
+def _visible(text):
+    """(text without invisible characters, index map back into *text*)."""
+    chars, index = [], []
+    for i, ch in enumerate(text):
+        if ch not in _INVISIBLE_CHARS and not 0xE0000 <= ord(ch) <= 0xE007F:
+            chars.append(ch)
+            index.append(i)
+    return "".join(chars), index
+
+
+def _hidden_spans(text):
+    spans = []
+    start = text.find("<!--")
+    while start != -1:
+        end = text.find("-->", start + 4)
+        if end == -1:
+            break
+        body = text[start + 4:end]
+        if _is_instruction(_visible(body)[0]):
+            spans.append((start, end + 3, body.strip()))
+        start = text.find("<!--", end + 3)
+    for m in _HIDDEN_ELEMENT.finditer(text):
+        body = _visible(_TAGS.sub(" ", m.group("body")))[0]
+        if _is_instruction(body):
+            spans.append((m.start(), m.end(), body.strip()))
+    for m in _TAG_RUN.finditer(text):
+        decoded = "".join(chr(ord(ch) - 0xE0000) for ch in m.group(0) if 0xE0020 <= ord(ch) <= 0xE007E)
+        if _is_instruction(decoded):
+            spans.append((m.start(), m.end(), decoded))
+    if _INVISIBLE_RE.search(text):
+        visible, index = _visible(text)
+        for start, end in _instruction_spans(visible):
+            o_start, o_end = index[start], index[end - 1] + 1
+            if _INVISIBLE_RE.search(text, o_start, o_end):
+                spans.append((o_start, o_end, visible[start:end]))
+    return spans
+
+
+def _instruction_spans(text):
+    spans = [(m.start(), m.end()) for m in _INSTRUCTION.finditer(text)]
+    spans += [(s, e) for s, e, _c in _phrase_spans(text)]
+    spans += [(m.start(), m.end()) for m in _SHELL.finditer(text)]
+    return spans
+
+
+def find_hidden_prompts(text):
+    """The instructions hidden in *text* (HTML comments, invisible elements, zero-width or
+    Unicode tag characters), made readable; empty list: none."""
+    if not isinstance(text, str) or not text:
+        return []
+    return [found for _s, _e, found in sorted(_hidden_spans(text))]
+
+
+def remove_hidden_prompts(text):
+    """*text* with each hidden instruction replaced by ``<hidden_prompts_removed>``; visible
+    text, and hidden content that is not an instruction, are kept. Accepts str, list,
+    dict, pydantic model or dataclass and returns the same type."""
+    if not isinstance(text, str):
+        return _structured(text, remove_hidden_prompts) if text is not None else text
+    spans = _hidden_spans(text)
+    if not spans:
+        return text
+    return _replace_spans(text, [(s, e) for s, e, _f in spans], "<hidden_prompts_removed>")
+
+
+# Encoded: base64 (standard or URL-safe, padded or not), hex, percent-encoding and ROT13,
+# up to two layers; a span is removed only when its decoded text is an instruction.
+_B64_TOKEN = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/=_-])")
+_HEX_TOKEN = re.compile(r"(?<![0-9A-Fa-f])(?:\\x)?(?:[0-9A-Fa-f]{2}(?:\\x)?){8,}(?![0-9A-Fa-f])")
+_PCT_TOKEN = re.compile(r"(?<![^\s\"'<>])[^\s\"'<>%]*%[0-9A-Fa-f]{2}[^\s\"'<>]*")
+_JOINED_STRINGS = re.compile(r"[\"']\s*\+\s*[\"']")
+_ROT13 = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+                       "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm")
+
+
+def _printable(decoded):
+    return decoded and sum(ch.isprintable() or ch.isspace() for ch in decoded) >= 0.95 * len(decoded)
+
+
+def _decode_token(token):
+    """Readable text *token* decodes to (base64 / hex / percent), else None."""
+    import urllib.parse
+    raw = token.replace("\\x", "")
+    if "%" in token:
+        if len(re.findall(r"%[0-9A-Fa-f]{2}", token)) < 4:
+            return None
+        decoded = urllib.parse.unquote(token)
+        return decoded if decoded != token and _printable(decoded) else None
+    if re.fullmatch(r"(?:[0-9A-Fa-f]{2}){8,}", raw):
+        try:
+            decoded = bytes.fromhex(raw).decode("utf-8")
+            if _printable(decoded):
+                return decoded
+        except (ValueError, UnicodeDecodeError):
+            pass
+    body = token.rstrip("=").replace("-", "+").replace("_", "/")
+    if len(body) % 4 == 1:
+        return None
+    try:
+        decoded = base64.b64decode(body + "=" * (-len(body) % 4), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    return decoded if _printable(decoded) else None
+
+
+def _decoded_instruction(decoded, depth=1):
+    if _is_instruction(decoded):
+        return decoded
+    if depth < 2:
+        for rx in (_B64_TOKEN, _HEX_TOKEN, _PCT_TOKEN):
+            for m in rx.finditer(decoded):
+                inner = _decode_token(m.group(0))
+                if inner and _decoded_instruction(inner, depth + 1):
+                    return inner
+    return None
+
+
+def _encoded_spans_wide(text):
+    spans, pieces = [], []
+    for rx in (_B64_TOKEN, _HEX_TOKEN, _PCT_TOKEN):
+        for m in rx.finditer(text):
+            decoded = _decode_token(m.group(0))
+            if decoded is None:
+                continue
+            pieces.append((m.start(), m.end(), decoded))
+            found = _decoded_instruction(decoded)
+            if found:
+                spans.append((m.start(), m.end(), found))
+    # A payload split over concatenated string literals ("SWdu..." + "aW5z...").
+    pieces.sort()
+    for i in range(len(pieces) - 1):
+        a, b = pieces[i], pieces[i + 1]
+        if _JOINED_STRINGS.fullmatch(text[a[1]:b[0]].strip()) or not text[a[1]:b[0]].strip():
+            joined = a[2] + b[2]
+            if _is_instruction(joined) and not (_is_instruction(a[2]) and _is_instruction(b[2])):
+                spans.append((a[0], b[1], joined))
+    for line_start, line in _lines_with_offsets(text):
+        rotated = line.translate(_ROT13)
+        for start, end in _instruction_spans(rotated):
+            if not _instruction_spans(line[start:end]):
+                spans.append((line_start + start, line_start + end, rotated[start:end]))
+    return spans
+
+
+def _lines_with_offsets(text):
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        yield offset, line.rstrip("\r\n")
+        offset += len(line)
+
+
+def find_encoded_prompts(text):
+    """The decoded instructions found in *text* (empty list: none)."""
+    if not isinstance(text, str) or not text:
+        return []
+    return [found for _s, _e, found in sorted(_encoded_spans_wide(text))]
+
+
+def remove_encoded_prompts(text):
+    """*text* with each encoded instruction (base64, URL-safe base64, hex, percent, ROT13)
+    replaced by ``<encoded_prompts_removed>``; encoded data that is not an instruction is
+    kept. Accepts str, list, dict, pydantic model or dataclass and returns the same type."""
+    if not isinstance(text, str):
+        return _structured(text, remove_encoded_prompts) if text is not None else text
+    spans = _encoded_spans_wide(text)
+    if not spans:
+        return text
+    return _replace_spans(text, [(s, e) for s, e, _f in spans], "<encoded_prompts_removed>")
+
+
+# Leetspeak: each letter also matches its usual substitutes (1 ! | for i and l, 3 for e,
+# 0 for o, 4 @ for a, 5 $ for s, 7 + for t ...); letters may be spaced out, with a wider
+# gap between words. A match of this wider list counts only if it uses a substitute or
+# spaced letters; the plain phrases sanitize_prompt removes are removed too.
+_LEET_LETTERS = {"a": "a4@", "b": "b8", "e": "e3", "g": "g96", "i": "i1!|l", "l": "l1|i",
+                 "o": "o0", "s": "s5$", "t": "t7+", "z": "z2"}
+
+
+def _leet_word(word):
+    return r" ?".join("[" + re.escape(_LEET_LETTERS.get(ch, ch)) + "]" for ch in word)
+
+
+def _leet_any(words):
+    return "(?:" + "|".join(_leet_word(w) for w in sorted(words, key=len, reverse=True)) + ")"
+
+
+_GAP = r"\s+"
+_LEET_PROMPT = re.compile(
+    _leet_any(("ignore", "disregard", "forget", "override", "bypass")) + _GAP
+    + "(?:" + _leet_any(("all", "any", "the", "your", "my", "previous", "prior", "above", "earlier",
+                         "safety", "system", "original")) + _GAP + "){0,3}"
+    + _leet_any(("instructions", "instruction", "rules", "guidelines", "restrictions", "prompt",
+                 "prompts", "filters", "policies", "policy"))
+    + "|" + _leet_any(("you",)) + _GAP + _leet_any(("are",)) + _GAP + _leet_any(("now",)) + _GAP
+    + "(?:" + _leet_any(("in", "an", "a")) + _GAP + ")?"
+    + _leet_any(("dan", "unrestricted", "unfiltered", "jailbroken", "evil", "developer", "admin", "god"))
+    + "|" + _leet_any(("reveal", "print", "show", "dump", "leak", "send")) + _GAP
+    + "(?:" + _leet_any(("the", "your", "all", "me")) + _GAP + "){0,2}"
+    + _leet_any(("system", "secrets", "secret", "passwords", "password", "credentials", "api"))
+    + "(?:" + _GAP + _leet_any(("prompt", "keys", "key")) + ")?",
+    re.I)
+_LEET_MARK = re.compile(r"[0-9@$!|+]|(?<![^\W\d_])[^\W\d_] [^\W\d_] [^\W\d_](?![^\W\d_])")
+
+
+def _leetspeak_spans(text):
+    spans = [(start, end, text[start:end]) for start, end, _c in _phrase_spans(text)]
+    for line_start, line in _lines_with_offsets(text):
+        for m in _LEET_PROMPT.finditer(line):
+            if _LEET_MARK.search(m.group(0)):
+                # The rest of the line belongs to the same instruction ("... 4nd r3v34l ...").
+                spans.append((line_start + m.start(), line_start + len(line.rstrip()), m.group(0)))
+        folded = _fold_leet(line)
+        if folded != line and _SHELL_LINE.search(folded) and not _SHELL_LINE.search(line):
+            lead = len(line) - len(line.lstrip())
+            spans.append((line_start + lead, line_start + len(line.rstrip()), folded.strip()))
+    return spans
+
+
+def find_leetspeak_prompts(text):
+    """The leetspeak or letter-spaced instructions found in *text* (empty list: none)."""
+    if not isinstance(text, str) or not text:
+        return []
+    return [text[s:e] for s, e, _f in sorted(_leetspeak_spans(text))]
+
+
+def remove_leetspeak_prompts(text):
+    """*text* with each leetspeak or letter-spaced instruction replaced by
+    ``<leetspeak_prompts_removed>`` (also the plain phrases sanitize_prompt removes);
+    ordinary text with digits is kept. Accepts str, list,
+    dict, pydantic model or dataclass and returns the same type."""
+    if not isinstance(text, str):
+        return _structured(text, remove_leetspeak_prompts) if text is not None else text
+    spans = _leetspeak_spans(text)
+    if not spans:
+        return text
+    return _replace_spans(text, [(s, e) for s, e, _f in spans], "<leetspeak_prompts_removed>")
+
+
+# Command requests (AI_APP_SEC_059): a request to run a shell command or code with a
+# target. A word or file name on its own (exec, bash, setup.sh) or a question about one
+# is not a request.
+_RUN_VERB = r"\b(?:run|execute|exec|eval|evaluate|launch)\b\s*:?\s*[`\"']?"
+_COMMAND_REQUEST = (
+    ("shell_command", re.compile(_RUN_VERB + _CMD, re.I)),
+    ("shell_command", re.compile(_RUN_VERB + r"(?:sudo\s+)?(?:bash|sh|zsh|ksh|python3?|node|perl|ruby|php|"
+                                 r"powershell|pwsh|cmd)\s+(?:-\w+\s+)?\S", re.I)),
+    ("code_execution", re.compile(_RUN_VERB + r"[\w.]+\([^)\n]*\)")),
+    ("secret_access", re.compile(
+        r"\b(?:cat|type|print|echo|read|dump|show|send)\b[^\n]{0,40}"
+        r"(?:/etc/(?:passwd|shadow)|os\.environ|process\.env|\.ssh/|\.aws/credentials|\$[A-Z_]*(?:KEY|TOKEN|SECRET))",
+        re.I)),
+)
+
+
+def _command_request_spans(text):
+    spans = []
+    for category, pattern in _COMMAND_REQUEST:
+        spans.extend((m.start(), m.end(), category) for m in pattern.finditer(text))
+    return spans
+
+
+def _command_findings(text):
+    found = {category for _s, _e, category in _command_request_spans(text)}
+    if _SHELL.search(text):
+        found.add("shell_command")
+    for name in find_code_execution(text):
+        found.add("pipe_to_shell" if name == "pipe_to_shell" else "code_execution")
+    return found
+
+
+def _strings(value, out, depth=0):
+    if isinstance(value, str):
+        out.append(value)
+    elif depth <= 8 and value is not None:
+        _structured(value, lambda s: out.append(s) or s, depth)
+    return out
+
+
+def find_command_requests(text):
+    """The kinds of command-execution request in *text* (empty list: none): shell
+    commands, code execution, piping a download into a shell, reading secrets; also when
+    the request is hidden, encoded or written in leetspeak. Accepts str, a list of chat
+    messages, dict or pydantic model. The caller refuses the request (HTTP 400) and logs
+    a fingerprint of it, never the text."""
+    found = set()
+    for piece in _strings(text, []):
+        if not piece:
+            continue
+        variants = [piece, _visible(piece)[0], _fold_leet(piece)]
+        variants += [f for _s, _e, f in _hidden_spans(piece)]
+        variants += [f for _s, _e, f in _encoded_spans_wide(piece)]
+        for variant in variants:
+            found |= _command_findings(variant)
+    return sorted(found)
+'''
+_UNIFAI_GUARD_JS_SOURCE = r'''/*
+ * Prompt-injection and PII guard added by Lineaje UnifAI remediation.
+ *
+ * JavaScript/TypeScript twin of unifai_guard.py: same rules, same markers. One
+ * shared module per directory: remediation fixes import it instead of adding
+ * their own sanitizers, so every route applies the same rules. No dependencies;
+ * runs in browsers (ES2018+) and Node 12+. Types: unifaiGuard.d.ts.
+ *
+ * - sanitizePrompt(text): removes prompt-injection spans from untrusted text
+ *   (user input, uploaded or retrieved content) before it reaches a model. Only
+ *   the matched span is replaced; the rest of the text, its newlines and layout
+ *   are kept.
+ * - findPromptAttacks(text): the attack categories found, for code that refuses
+ *   input instead of cleaning it.
+ * - redactPii(text, categories): masks the personal data a policy defines (its
+ *   runtime.routine.params.categories, per region) in text sent to a model, a
+ *   log, a user or an external service.
+ * - maskPii(text, categories): the same detection as redactPii, in masked form for
+ *   text shown to a user: identifiers (SSN, card, account) keep their last 4 digits
+ *   ("***-**-6789"), other values become "<masked:label>".
+ * - sanitizeMessages(messages): sanitizePrompt on the user/tool turns of a chat
+ *   message list (string content and text parts).
+ * - findCodeExecution(text): the dynamic code-execution primitives found in model
+ *   output (eval, exec, os.system, subprocess with shell=True, JS eval / Function /
+ *   child_process, shell eval, piping a download into a shell, string timers, unsafe
+ *   deserialization).
+ * - removeSuspiciousContent(text): uploaded or fetched file content with shell commands
+ *   replaced by <suspicious_content_removed>; findShellCommands(text) lists them.
+ * - removeHiddenPrompts(text) (AI_APP_SEC_001): instructions hidden in HTML comments,
+ *   invisible elements, zero-width, bidi or Unicode tag characters, replaced by
+ *   <hidden_prompts_removed>; findHiddenPrompts(text) lists them.
+ * - removeEncodedPrompts(text) (AI_APP_SEC_002): instructions encoded as base64
+ *   (standard or URL-safe, padded or not, also split over concatenated strings), hex,
+ *   percent-encoding or ROT13, replaced by <encoded_prompts_removed>;
+ *   findEncodedPrompts(text) lists them decoded.
+ * - removeLeetspeakPrompts(text) (AI_APP_SEC_032): instructions in leetspeak or spaced
+ *   letters, replaced by <leetspeak_prompts_removed>; findLeetspeakPrompts(text).
+ * - findCommandRequests(value) (AI_APP_SEC_059): the kinds of command-execution request
+ *   in a prompt (string, chat messages or object); the caller refuses it (HTTP 400).
+ * The remove* functions accept strings, arrays and objects and return the same shape.
+ *
+ * Never apply these to identifiers or lookup keys (user ids, file names,
+ * document ids): those must reach their service unchanged.
+ */
+
+// UNIFAI-GUARD owner="Lineaje UnifAI": generated by UnifAI remediation scans; do not edit.
+// Scans read UNIFAI_GUARD_MANIFEST (without running this file) to reuse this module instead
+// of adding another guardrail, and ship a newer version that only adds routines when a
+// policy needs one listed nowhere below. Keys are the policies' runtime.routine.id values.
+export const UNIFAI_GUARD_MANIFEST = {
+  "owner": "Lineaje UnifAI",
+  "version": "2.5.0",
+  "routines": {
+    "sanitize_prompt_injection": ["sanitizePrompt", "findPromptAttacks", "sanitizeMessages",
+                                  "removeSuspiciousContent", "findShellCommands"],
+    "mask_pii": ["redactPii", "maskPii"],
+    "mask_pii_and_secrets": ["redactPii", "maskPii"],
+    "validate_llm_output": ["findCodeExecution"],
+    "remove_hidden_prompts": ["removeHiddenPrompts", "findHiddenPrompts"],
+    "remove_encoded_prompts": ["removeEncodedPrompts", "findEncodedPrompts"],
+    "remove_leetspeak_prompts": ["removeLeetspeakPrompts", "findLeetspeakPrompts"],
+    "remove_suspicious_content": ["removeSuspiciousContent", "findShellCommands"],
+    "reject_command_requests": ["findCommandRequests"]
+  }
+};
+
+export const VERSION = "2.5.0";
+
+// --- prompt injection -------------------------------------------------------
+
+const Q = "(?:all|any|every|the|your|my|of\\s+the)?\\s*";
+const PHRASES = [
+  ["instruction_override", new RegExp(
+    "\\b(?:ignore|disregard|forget|override|bypass|skip)\\s+" + Q
+    + "(?:(?:previous|prior|above|earlier|preceding|original|existing|safety|system)\\s+)+"
+    + "(?:instructions?|rules|guidelines|prompts?|directions|directives|constraints)\\b"
+    + "|\\bforget\\s+everything\\s+(?:above|before|you\\s+were\\s+told)\\b"
+    + "|\\bsystem\\s+override\\b", "gi")],
+  ["role_hijack", new RegExp(
+    "\\byou\\s+are\\s+now\\s+(?:in\\s+)?(?:an?\\s+)?"
+    + "(?:dan|unrestricted|unfiltered|jailbroken|evil|developer\\s+mode|admin(?:istrator)?\\s+mode|god\\s+mode)\\b"
+    + "|\\bact\\s+as\\s+(?:an?\\s+)?(?:unrestricted|unfiltered|jailbroken|uncensored)\\s+(?:ai|model|assistant|chatbot)\\b"
+    + "|\\b(?:developer|jailbreak|god)\\s+mode\\s+(?:enabled|activated|on)\\b", "gi")],
+  ["prompt_exfiltration", new RegExp(
+    "\\b(?:reveal|show|print|display|output|repeat|leak|dump|tell\\s+me)\\s+(?:me\\s+)?"
+    + "(?:all\\s+|your\\s+|the\\s+)*(?:full\\s+|entire\\s+|hidden\\s+|initial\\s+|original\\s+|secret\\s+)?"
+    + "(?:system\\s+(?:prompts?|instructions|messages?)|initial\\s+prompts?|hidden\\s+instructions)\\b", "gi")],
+  ["data_exfiltration", new RegExp(
+    "\\b(?:reveal|list|dump|show|give\\s+me)\\s+(?:me\\s+)?all\\s+(?:the\\s+)?"
+    + "(?:confidential|secret|private|sensitive)\\s+(?:information|data)\\b"
+    + "|\\b(?:user\\s+passwords|api\\s+keys|access\\s+tokens|private\\s+keys)\\b"
+    + "|\\bprovide\\s+unrestricted\\s+access\\b", "gi")]
+];
+const EXFIL_VERB = /\b(?:list|reveal|dump|show|give|send|print|output|leak)\b/i;
+const EXFIL_OBJECTS = ["user passwords", "api keys", "access tokens", "private keys"];
+
+const HIDDEN_HTML = new RegExp(
+  "<(?<tag>[a-z][a-z0-9]*)\\b[^>]*?(?:\\shidden\\b|style\\s*=\\s*[\"'][^\"']*"
+  + "(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden|font-size\\s*:\\s*0)[^\"']*[\"']"
+  + "|class\\s*=\\s*[\"'][^\"']*\\b(?:hidden|invisible|sr-only)\\b[^\"']*[\"'])[^>]*>"
+  + "[\\s\\S]*?</\\k<tag>\\s*>", "gi");
+const MARKDOWN_IMAGE_EXFIL = /!\[[^\]\n]*\]\(\s*https?:\/\/[^)\s]*\?[^)\s]*\)/gi;
+const SHELL = new RegExp(
+  "\\b(?:bash|sh|zsh|ksh|powershell|pwsh|cmd(?:\\.exe)?)\\s+(?:-c|/c|-command)\\s+\\S[^\\n]*"
+  + "|\\b(?:curl|wget)\\s+[^\\n|]*\\|\\s*(?:ba|z)?sh\\b"
+  + "|\\brm\\s+-rf\\s+/\\S*", "gi");
+const CHAT_TOKENS = /<\|[a-z_]{2,20}\|>|\[\/?INST\]|<<\/?SYS>>/gi;
+const BASE64 = /(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{20,}={0,2}(?![A-Za-z0-9+/=])/g;
+
+const LEET = { "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s" };
+const SPACED = /(?<!\S)(?:[A-Za-z0-9@$]\s){3,}[A-Za-z0-9@$](?!\S)/g;
+
+function matches(pattern, text) {
+  pattern.lastIndex = 0;
+  const out = [];
+  let m;
+  while ((m = pattern.exec(text)) !== null) {
+    if (m[0] === "") {
+      pattern.lastIndex += 1;
+      continue;
+    }
+    out.push(m);
+  }
+  return out;
+}
+
+// [normalized text, index map]: leetspeak folded, single-letter spacing removed.
+// Every character of the normalized text maps back to its index in text, so a
+// match removes exactly the original span.
+function normalized(text) {
+  const drop = new Set();
+  for (const m of matches(SPACED, text)) {
+    for (let i = m.index; i < m.index + m[0].length; i++) {
+      if (/\s/.test(text[i])) drop.add(i);
+    }
+  }
+  const chars = [];
+  const index = [];
+  for (let i = 0; i < text.length; i++) {
+    if (!drop.has(i)) {
+      const ch = text[i];
+      chars.push(Object.prototype.hasOwnProperty.call(LEET, ch) ? LEET[ch] : ch);
+      index.push(i);
+    }
+  }
+  return [chars.join(""), index];
+}
+
+function phraseSpans(text) {
+  const spans = [];
+  const [norm, index] = normalized(text);
+  for (const [category, pattern] of PHRASES) {
+    for (const m of matches(pattern, norm)) {
+      const start = m.index;
+      const end = m.index + m[0].length;
+      if (category === "data_exfiltration"
+          && EXFIL_OBJECTS.some((o) => m[0].toLowerCase().startsWith(o))) {
+        // "user passwords" alone is ordinary text ("list all passwords policies");
+        // it is an attack only as the object of a request verb in the same sentence.
+        const sentenceStart = Math.max(norm.lastIndexOf(".", start - 1), norm.lastIndexOf("\n", start - 1)) + 1;
+        if (!EXFIL_VERB.test(norm.slice(sentenceStart, start))) continue;
+      }
+      spans.push([index[start], index[end - 1] + 1, category]);
+    }
+  }
+  return spans;
+}
+
+function decodeBase64(token) {
+  try {
+    let bytes;
+    if (typeof atob === "function") {
+      const bin = atob(token);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } else if (typeof Buffer !== "undefined") {
+      bytes = Buffer.from(token, "base64");
+    } else {
+      return null;
+    }
+    if (typeof TextDecoder === "undefined") return null;
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (e) {
+    return null;
+  }
+}
+
+function isPrintableOrSpace(ch) {
+  const c = ch.codePointAt(0);
+  return /\s/.test(ch) || (c >= 0x20 && c !== 0x7f && !(c >= 0x80 && c < 0xa0));
+}
+
+function encodedSpans(text) {
+  const spans = [];
+  for (const m of matches(BASE64, text)) {
+    const token = m[0];
+    if (token.length % 4) continue;
+    const decoded = decodeBase64(token);
+    if (decoded === null) continue;
+    const chars = Array.from(decoded);
+    if (chars.filter(isPrintableOrSpace).length < 0.95 * chars.length) continue;
+    if (phraseSpans(decoded).length || matches(SHELL, decoded).length) {
+      spans.push([m.index, m.index + token.length, "encoded_payload"]);
+    }
+  }
+  return spans;
+}
+
+function attackSpans(text) {
+  const spans = phraseSpans(text).concat(encodedSpans(text));
+  for (const [category, pattern] of [["hidden_content", HIDDEN_HTML],
+                                     ["markdown_image_exfiltration", MARKDOWN_IMAGE_EXFIL],
+                                     ["command_injection", SHELL],
+                                     ["chat_template_tokens", CHAT_TOKENS]]) {
+    for (const m of matches(pattern, text)) spans.push([m.index, m.index + m[0].length, category]);
+  }
+  spans.sort((a, b) => a[0] - b[0] || a[1] - b[1] || (a[2] < b[2] ? -1 : a[2] > b[2] ? 1 : 0));
+  const merged = [];
+  for (const [start, end, category] of spans) {
+    const prev = merged[merged.length - 1];
+    if (prev && start < prev[1]) {
+      merged[merged.length - 1] = [prev[0], Math.max(prev[1], end), prev[2]];
+    } else {
+      merged.push([start, end, category]);
+    }
+  }
+  return merged;
+}
+
+/** Attack categories found in text (empty array: none). */
+export function findPromptAttacks(text) {
+  if (typeof text !== "string" || !text) return [];
+  return Array.from(new Set(attackSpans(text).map((s) => s[2]))).sort();
+}
+
+/** text with prompt-injection spans replaced by a marker; anything else unchanged. */
+export function sanitizePrompt(text) {
+  if (typeof text !== "string" || !text) return text;
+  let out = text;
+  const spans = attackSpans(text);
+  for (let i = spans.length - 1; i >= 0; i--) {
+    const [start, end, category] = spans[i];
+    out = out.slice(0, start) + "<prompt_injection_removed: " + category + ">" + out.slice(end);
+  }
+  return out;
+}
+
+/**
+ * A copy of a chat message list with sanitizePrompt applied to the given roles.
+ * Handles string content and lists of content parts ({type: "text", text: ...}).
+ * System and assistant turns are the application's own text and are left as they are.
+ */
+export function sanitizeMessages(messages, roles = ["user", "tool", "function"]) {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map((message) => {
+    if (!message || typeof message !== "object" || roles.indexOf(message.role) === -1) return message;
+    const copy = Object.assign({}, message);
+    const content = copy.content;
+    if (typeof content === "string") {
+      copy.content = sanitizePrompt(content);
+    } else if (Array.isArray(content)) {
+      copy.content = content.map((part) => (part && typeof part === "object" && typeof part.text === "string"
+        ? Object.assign({}, part, { text: sanitizePrompt(part.text) })
+        : part));
+    }
+    return copy;
+  });
+}
+
+// --- PII --------------------------------------------------------------------
+// What is personal data is defined by the policy: callers pass the violated
+// policy's runtime.routine.params.categories (the scanner writes them into each
+// call). There is no default set. A category with no text detector here
+// (ethnicity, biometrics, the secret types of 011) is not redacted;
+// unsupportedPiiCategories lists them so the scanner can say so in the PR.
+
+function luhn(digits) {
+  let total = 0;
+  const parity = digits.length % 2;
+  for (let i = 0; i < digits.length; i++) {
+    let d = Number(digits[i]);
+    if (i % 2 === parity) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    total += d;
+  }
+  return total % 10 === 0;
+}
+
+function isCard(value) {
+  const digits = value.replace(/\D/g, "");
+  return digits.length >= 13 && digits.length <= 19 && "23456".indexOf(digits[0]) !== -1
+    && new Set(digits).size > 1 && luhn(digits);
+}
+
+// A label pattern matched case-insensitively while the value keeps its own case
+// (JavaScript has no inline (?i:...) group in every browser): letters outside
+// escapes and character classes become [xX].
+function caseless(pattern) {
+  let out = "";
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "\\") {
+      out += ch + (pattern[i + 1] || "");
+      i += 1;
+    } else if (ch === "[" && !inClass) {
+      inClass = true;
+      out += ch;
+    } else if (ch === "]" && inClass) {
+      inClass = false;
+      out += ch;
+    } else if (!inClass && /[a-z]/i.test(ch)) {
+      out += "[" + ch.toLowerCase() + ch.toUpperCase() + "]";
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+const STREET = "(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl"
+  + "|Terrace|Parkway|Pkwy|Highway|Hwy)\\.?";
+const DATE = "(?:\\d{4}-\\d{2}-\\d{2}|\\d{1,2}/\\d{1,2}/\\d{2,4})";
+const NUM = "(?:\\s*(?:no\\.?|number|num|#|id))?\\s*[:#=]?\\s*";
+const OCTET = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
+const code = (min, max) => "(?=[A-Z0-9-]*\\d)[A-Z0-9-]{" + min + "," + max + "}\\b";
+
+// Pattern that keeps the label and masks the value after it. The label is always
+// case-insensitive; caseSensitiveValue keeps a value's capitals (names).
+function labelled(label, value, caseSensitiveValue) {
+  return new RegExp("(?<label>\\b" + caseless("(?:" + label + ")") + caseless("(?:" + NUM + ")") + ")" + value,
+    caseSensitiveValue ? "g" : "gi");
+}
+
+// policy category -> patterns, applied in this order (longer, more specific shapes
+// first: a card before a phone); a pattern with a "label" group keeps the label.
+const DETECTORS = [
+  ["email", [/(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?![\w-])/g]],
+  ["credit_card", [/(?<![\w-])\d{4}(?:[ -]?\d{4}){2}[ -]?\d{1,7}(?![\w-])/g]],
+  ["financial_account_number", [
+    /\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}(?:\s?[A-Z0-9]{1,3})?\b/g,
+    labelled("(?:bank\\s+|checking\\s+|savings\\s+)?(?:account|acct|a/c)|routing|IBAN", code(6, 34))]],
+  ["ssn", [/(?<![\w-])\d{3}-\d{2}-\d{4}(?![\w-])/g,
+           labelled("SSN|social\\s+security", "\\d{3}\\s\\d{2}\\s\\d{4}\\b")]],
+  ["taxpayer_id", [labelled("tax(?:payer)?\\s*id(?:entification)?|EIN|TIN", code(8, 15))]],
+  ["passport_number", [labelled("passport", "(?=[A-Z0-9]*\\d)[A-Z0-9]{6,9}\\b")]],
+  ["drivers_license_number", [labelled("driver'?s?\\s+licen[cs]e|DL", code(5, 20))]],
+  ["medical_records", [labelled("MRN|medical\\s+record|patient\\s+id", code(4, 20))]],
+  ["employee_id", [labelled("employee|emp|staff", code(3, 20))]],
+  ["school_id", [labelled("student|school", code(3, 20))]],
+  ["vehicle_identification_number", [labelled("VIN|vehicle\\s+identification", "[A-HJ-NPR-Z0-9]{17}\\b")]],
+  ["mac_address", [/(?<![\w:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![\w:-])/g]],
+  ["ip_address", [new RegExp("(?<![\\w.])(?<!v)(?:" + OCTET + "\\.){3}" + OCTET + "(?![\\w.])", "g"),
+                  /(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![\w:])/g]],
+  ["fine_location", [labelled("lat(?:itude)?|gps|location|coord(?:inate)?s?",
+                              "-?\\d{1,3}\\.\\d{4,},\\s*-?\\d{1,3}\\.\\d{4,}\\b")]],
+  ["year_of_birth", [labelled("DOB|D\\.O\\.B\\.?|date\\s+of\\s+birth|born\\s+on|birth\\s*date", DATE),
+                     labelled("born\\s+in|year\\s+of\\s+birth|birth\\s+year", "(?:19|20)\\d{2}\\b")]],
+  ["birthplace", [labelled("place\\s+of\\s+birth|birth\\s*place",
+                           "[A-Z][A-Za-z'.-]+(?:[ ,]+[A-Z][A-Za-z'.-]+){0,3}", true)]],
+  ["mothers_maiden_name", [labelled("mother'?s\\s+maiden\\s+name(?:\\s+is)?",
+                                    "[A-Z][A-Za-z'-]+(?:\\s[A-Z][A-Za-z'-]+)?", true)]],
+  ["phone", [/(?<![\w+(])(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?![\w-])/g,
+             /(?<![\w+])\+\d{1,3}[\s.-]?\d{2,5}(?:[\s.-]?\d{2,5}){1,3}(?![\w-])/g,
+             labelled("phone|mobile|cell|tel|telephone|fax", "\\+?\\d[\\d\\s().-]{6,}\\d\\b")]],
+  ["home_address", [new RegExp("\\b\\d{1,6}\\s+(?:[A-Z][a-z]+\\s){1,3}" + STREET
+    + "(?:,\\s*[A-Z][a-z]+(?:\\s[A-Z][a-z]+)*)?(?:,\\s*[A-Z]{2}(?:\\s+\\d{5}(?:-\\d{4})?)?)?", "g")]]
+];
+const DETECTOR_NAMES = DETECTORS.map((d) => d[0]);
+
+function normalizedCategories(categories) {
+  if (typeof categories === "string") categories = [categories];
+  if (!categories || !categories.length) return [];
+  return Array.from(categories).map((c) => String(c).trim().toLowerCase()).filter((c) => c);
+}
+
+/** The policy categories this guard has no text detector for (they are not redacted). */
+export function unsupportedPiiCategories(categories) {
+  return normalizedCategories(categories).filter((c) => DETECTOR_NAMES.indexOf(c) === -1);
+}
+
+// maskPii: one fixed label per category; identifiers keep their last 4 digits.
+const MASK_LABEL = {
+  phone: "phone", email: "email", home_address: "address", year_of_birth: "dob",
+  passport_number: "passport", drivers_license_number: "drivers_license", taxpayer_id: "tax_id",
+  employee_id: "employee_id", school_id: "school_id", vehicle_identification_number: "vin",
+  ip_address: "ip_address", mac_address: "mac_address", birthplace: "birthplace",
+  mothers_maiden_name: "maiden_name", medical_records: "medical", fine_location: "location"
+};
+const KEEP_LAST4 = new Set(["ssn", "credit_card", "financial_account_number"]);
+
+function last4(value) {
+  const digits = [];
+  for (let i = 0; i < value.length; i++) if (/\d/.test(value[i])) digits.push(i);
+  const keep = new Set(digits.slice(-4));
+  let out = "";
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    out += (!/[A-Za-z0-9]/.test(ch) || keep.has(i)) ? ch : "*";
+  }
+  return out;
+}
+
+/**
+ * text with the personal data of the given policy categories masked for display:
+ * identifiers keep their last 4 digits, other values become <masked:label>.
+ */
+// fn applied to every string inside value, keeping its shape: arrays and plain or class
+// objects come back with their text fields masked (a copy; the input is not changed).
+function structured(value, fn, depth) {
+  depth = depth || 0;
+  if (typeof value === "string") return fn(value);
+  if (value === null || value === undefined || depth > 8 || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((v) => structured(v, fn, depth + 1));
+  if (value instanceof Date || (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) ||
+      ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return value;
+  const out = Object.create(Object.getPrototypeOf(value));
+  for (const key of Object.keys(value)) out[key] = structured(value[key], fn, depth + 1);
+  return out;
+}
+
+export function maskPii(text, categories) {
+  if (typeof text !== "string") return structured(text, (t) => maskPii(t, categories));
+  if (!text) return text;
+  const wanted = new Set(normalizedCategories(categories));
+  let out = text;
+  for (const [category, patterns] of DETECTORS) {
+    if (!wanted.has(category)) continue;
+    for (const pattern of patterns) {
+      pattern.lastIndex = 0;
+      out = out.replace(pattern, function () {
+        const args = Array.prototype.slice.call(arguments);
+        const match = args[0];
+        const groups = typeof args[args.length - 1] === "object" ? args[args.length - 1] : null;
+        if (category === "credit_card" && !isCard(match)) return match;
+        const label = (groups && groups.label) || "";
+        const value = match.slice(label.length);
+        if (KEEP_LAST4.has(category)) return label + last4(value);
+        return label + "<masked:" + (MASK_LABEL[category] || category) + ">";
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * text with the personal data of the given policy categories replaced by
+ * <redacted:category>; anything else unchanged. categories is the violated
+ * policy's runtime.routine.params.categories (e.g. ["ssn", "email", "phone"]);
+ * only those are redacted.
+ */
+export function redactPii(text, categories) {
+  if (typeof text !== "string") return structured(text, (t) => redactPii(t, categories));
+  if (!text) return text;
+  const wanted = new Set(normalizedCategories(categories));
+  let out = text;
+  for (const [category, patterns] of DETECTORS) {
+    if (!wanted.has(category)) continue;
+    for (const pattern of patterns) {
+      pattern.lastIndex = 0;
+      out = out.replace(pattern, function () {
+        const args = Array.prototype.slice.call(arguments);
+        const match = args[0];
+        const groups = typeof args[args.length - 1] === "object" ? args[args.length - 1] : null;
+        if (category === "credit_card" && !isCard(match)) return match;
+        const label = (groups && groups.label) || "";
+        return label + "<redacted:" + category + ">";
+      });
+    }
+  }
+  return out;
+}
+
+// --- model output: dynamic code execution -------------------------------------
+
+const CODE_EXECUTION = [
+  ["python_eval_exec", /(?<![\w.])(?:eval|exec|compile|__import__)\s*\(/],
+  ["os_command", /\bos\.(?:system|popen|exec[lv]p?e?|spawn[lv]p?e?)\s*\(/],
+  ["subprocess_shell", /\bsubprocess\.\w+\s*\([^)]*shell\s*=\s*True/s],
+  ["js_eval", /(?<![\w.])(?:eval|new\s+Function|Function)\s*\(/],
+  ["js_child_process", /\b(?:child_process\.)?(?:exec|execSync|spawn|spawnSync)\s*\(\s*['"`]/],
+  ["shell_eval", /(?:^|[;&|\s])(?:eval|source)\s+['"$]|\b(?:bash|sh|zsh)\s+-c\s+\S/m],
+  ["pipe_to_shell", /\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b/],
+  ["destructive_command", /\brm\s+-rf\s+\/|\bmkfs(?:\.\w+)?\s|\bdd\s+if=|:\(\)\s*\{\s*:\|:&\s*\};:/],
+  ["dynamic_lookup", /\bgetattr\s*\(\s*(?:__builtins__|builtins|globals\s*\(\s*\)|os)\s*,|["'](?:ev|ex|sys|po)["']\s*\+\s*["'](?:al|ec|tem|pen)["']/],
+  ["js_string_timer", /\bset(?:Timeout|Interval|Immediate)\s*\(\s*['"`]/],
+  ["unsafe_deserialization", /\b(?:pickle|cPickle|_pickle|dill|marshal|shelve|jsonpickle)\.(?:loads?|decode|open)\s*\(|\byaml\.(?:unsafe_)?load\s*\((?![^)]*Safe)/]
+];
+
+/**
+ * The dynamic code-execution primitives found in text (empty array: none). For model
+ * output that is executed, written to disk or shown as runnable code; the caller
+ * decides what to do with a finding. Never changes the text.
+ */
+export function findCodeExecution(text) {
+  if (typeof text !== "string" || !text) return [];
+  return Array.from(new Set(CODE_EXECUTION.filter(([, p]) => p.test(text)).map(([n]) => n))).sort();
+}
+
+// --- uploaded file content: shell commands ---------------------------------------
+
+const CMD = "(?:sudo\\s+)?(?:"
+  + "alias\\s+[\\w.-]+=\\S*"
+  + "|(?:rg|ripgrep)\\s+[-\\w'\"./*]+"
+  + "|curl\\s+(?:-\\S+\\s+)*\\S+"
+  + "|wget\\s+(?:-\\S+\\s+)*\\S+"
+  + "|rm\\s+(?:-[a-z]+\\s+)*[\\w./~*$-]+"
+  + "|echo\\s+[^\\n>]*>>?\\s*\\S+"
+  + "|dd\\s+(?:if|of)=\\S+"
+  + "|git\\s+(?:clone|push|pull|fetch|reset|checkout|remote|config|rm|apply|am)\\b[^\\n]*"
+  + "|tar\\s+-?[a-z]*[xcz][a-z]*f?\\s+\\S+"
+  + "|chmod\\s+(?:-[a-z]+\\s+)*[0-7ugoa+=,rwxst-]+\\s+\\S+"
+  + "|chown\\s+(?:-[a-z]+\\s+)*[\\w.:-]+\\s+\\S+"
+  + "|fsck(?:\\.\\w+)?(?:\\s+-\\S+)*\\s+\\S+"
+  + "|mkfs(?:\\.\\w+)?\\s+\\S+"
+  + "|shred\\s+(?:-\\S+\\s+)*\\S+"
+  + "|mkswap\\s+(?:-\\S+\\s+)*\\S+"
+  + "|exec\\s+(?:-\\S+\\s+)*[/~$.]\\S*"
+  + "|sed\\s+(?:-[a-z]*i\\S*\\s+(?:-\\S+\\s+)*\\S+|(?:-\\S+\\s+)*[\"']?s/[^/\\n]*/[^/\\n]*/)"
+  + "|(?:ba|z|k)?sh\\s+(?:-\\S+\\s+)*[\\w./~$-]+\\.sh\\b"
+  + "|mv\\s+(?:-[a-z]+\\s+)*[\\w./~$*-]+\\s+[\\w./~$*-]+"
+  + "|(?:eval|source)\\s+\\S+"
+  + "|export\\s+[A-Z_][A-Z0-9_]*=\\S*"
+  + ")";
+// A download piped into a shell is removed as a whole (curl ... | sh), not up to the pipe.
+const SHELL_LINE = new RegExp("(?:(?<=^)|(?<=\\n)|(?<=[;&|`]))[ \\t]*(?:[$#>]\\s*)?" + CMD + "[^\\n;&|]*"
+  + "(?:\\|\\s*(?:sudo\\s+)?(?:ba|z|k|da)?sh\\b[^\\n;&|]*)?", "gi");
+// A command asked for in prose ("Tell the agent to execute chmod 777 /etc/shadow"), and
+// destructive commands wherever they appear.
+const CMD_IN_PROSE = new RegExp("\\b(?:run|execute|exec|type|enter|paste|invoke|launch)\\b\\s*:?\\s*[`\"']?(?<cmd>"
+  + CMD + "[^\\n;&|`\"']*)", "gi");
+const DESTRUCTIVE = new RegExp(
+  "\\b(?:mkfs(?:\\.\\w+)?|mkswap|shred)\\s+(?:-\\S+\\s+)*[/~$]\\S*"
+  + "|\\bdd\\s+(?:if|of)=\\S+(?:\\s+(?:if|of|bs|count|seek)=\\S+)*"
+  + "|\\brm\\s+-[a-z]*r[a-z]*\\s+[/~$]\\S*"
+  + "|\\bchmod\\s+(?:-R\\s+)?[0-7]{3,4}\\s+/\\S+", "gi");
+const BASE64_SHORT = /(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])/g;
+const LEET_MULTI = [["|-|", "h"], ["|_|", "u"], ["|<", "k"], ["|\\|", "n"], ["/\\", "a"], ["()", "o"]];
+
+function foldLeet(line) {
+  for (const [seq, ch] of LEET_MULTI) line = line.split(seq).join(ch);
+  let out = "";
+  for (const ch of line) out += Object.prototype.hasOwnProperty.call(LEET, ch) ? LEET[ch] : ch;
+  return out;
+}
+
+function hasShell(text) {
+  SHELL_LINE.lastIndex = 0;
+  return SHELL_LINE.test(text);
+}
+
+function shellSpans(text) {
+  const spans = matches(SHELL_LINE, text).map((m) => [m.index, m.index + m[0].length]);
+  for (const m of matches(CMD_IN_PROSE, text)) {
+    const end = m.index + m[0].length;
+    spans.push([end - m.groups.cmd.length, end]);
+  }
+  for (const m of matches(DESTRUCTIVE, text)) spans.push([m.index, m.index + m[0].length]);
+  let offset = 0;
+  for (const line of text.split(/(?<=\n)/)) {
+    const body = line.replace(/[\r\n]+$/, "");
+    const folded = foldLeet(body);
+    if (folded !== body && hasShell(folded) && !hasShell(body)) {
+      const lead = body.length - body.replace(/^\s+/, "").length;
+      spans.push([offset + lead, offset + body.length]);
+    }
+    offset += line.length;
+  }
+  for (const m of matches(BASE64_SHORT, text)) {
+    const token = m[0];
+    if (token.length % 4) continue;
+    const decoded = decodeBase64(token);
+    if (decoded !== null && hasShell(decoded)) spans.push([m.index, m.index + token.length]);
+  }
+  spans.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged = [];
+  for (const [start, end] of spans) {
+    const prev = merged[merged.length - 1];
+    if (prev && start <= prev[1]) prev[1] = Math.max(prev[1], end);
+    else merged.push([start, end]);
+  }
+  return merged;
+}
+
+/** The shell-command lines found in uploaded or fetched content (empty array: none). */
+export function findShellCommands(text) {
+  if (typeof text !== "string" || !text) return [];
+  return shellSpans(text).map(([s, e]) => text.slice(s, e).trim());
+}
+
+/** Uploaded or fetched content with each shell command replaced by <suspicious_content_removed>. */
+export function removeSuspiciousContent(text) {
+  if (typeof text !== "string") return structured(text, removeSuspiciousContent);
+  let out = text;
+  const spans = shellSpans(text);
+  for (let i = spans.length - 1; i >= 0; i--) {
+    out = out.slice(0, spans[i][0]) + "<suspicious_content_removed>" + out.slice(spans[i][1]);
+  }
+  return out;
+}
+
+
+// --- hidden, encoded and leetspeak prompts; command requests ------------------------
+// (AI_APP_SEC_001 / 002 / 032 / 059). One function per policy, so a fix for one policy
+// never changes what another policy's function does. sanitizePrompt (AI_APP_SEC_070)
+// keeps its own phrase list; the wider one below is used only by these functions.
+
+const INSTRUCTION = new RegExp(
+  "\\b(?:ignore|disregard|forget|override|bypass)\\s+"
+  + "(?:(?:all|any|every|the|your|my|these|those|of|previous|prior|above|earlier|preceding|"
+  + "original|existing|safety|system|security)\\s+){0,4}"
+  + "(?:instructions?|rules|guidelines|guardrails|restrictions|polic(?:y|ies)|prompts?|filters?)\\b"
+  + "|\\byou\\s+are\\s+now\\s+(?:in\\s+)?(?:an?\\s+)?(?:dan|unrestricted|unfiltered|jailbroken|evil|"
+  + "developer\\s+mode|admin(?:istrator)?\\s+mode|god\\s+mode)\\b"
+  + "|\\b(?:reveal|print|show|dump|leak|send|output|exfiltrate|list)\\s+(?:me\\s+)?(?:all\\s+|the\\s+|your\\s+|any\\s+)*"
+  + "(?:system\\s+prompts?|hidden\\s+instructions|secrets?|(?:user\\s+)?passwords?|api[\\s_-]?keys?|credentials|"
+  + "access\\s+tokens?|private\\s+keys?)\\b"
+  + "|\\bdo\\s+anything\\s+now\\b", "gi");
+
+function spansOf(pattern, text) {
+  return matches(pattern, text).map((m) => [m.index, m.index + m[0].length]);
+}
+
+// text (already decoded / made visible) asks the model to override its rules, leak
+// secrets or run a command.
+function isInstruction(text) {
+  if (typeof text !== "string" || !text.trim()) return false;
+  return spansOf(INSTRUCTION, text).length > 0 || phraseSpans(text).length > 0
+    || matches(SHELL, text).length > 0 || hasShell(text.trim()) || commandRequestSpans(text).length > 0;
+}
+
+function replaceSpans(text, spans, marker) {
+  spans = spans.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged = [];
+  for (const [start, end] of spans) {
+    const prev = merged[merged.length - 1];
+    if (prev && start <= prev[1]) prev[1] = Math.max(prev[1], end);
+    else merged.push([start, end]);
+  }
+  let out = text;
+  for (let i = merged.length - 1; i >= 0; i--) {
+    out = out.slice(0, merged[i][0]) + marker + out.slice(merged[i][1]);
+  }
+  return out;
+}
+
+function linesWithOffsets(text) {
+  const out = [];
+  let offset = 0;
+  for (const line of text.split(/(?<=\n)/)) {
+    out.push([offset, line.replace(/[\r\n]+$/, "")]);
+    offset += line.length;
+  }
+  return out;
+}
+
+// Hidden: invisible characters, Unicode tag characters, bidi overrides, HTML comments and
+// elements styled to be invisible (hidden, display:none, visibility:hidden, opacity:0,
+// font-size:0/1, white text, off-screen, sr-only).
+const INVISIBLE_CHARS = "\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff\u00ad\u180e"
+  + "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069";
+const INVISIBLE_RE = new RegExp("[" + INVISIBLE_CHARS + "]");
+const TAG_RUN = /(?:\uDB40[\uDC00-\uDC7F])+/g;
+const HIDDEN_ELEMENT = new RegExp(
+  "<(?<tag>[a-z][a-z0-9]*)\\b[^>]*?(?:\\shidden\\b|\\saria-hidden\\s*=\\s*[\"']true[\"']"
+  + "|style\\s*=\\s*[\"'][^\"']*(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden"
+  + "|font-size\\s*:\\s*[01](?:\\.\\d+)?(?:px|pt|em|rem)?(?=\\s*[;\"'])"
+  + "|opacity\\s*:\\s*0(?:\\.0+)?(?=\\s*[;\"'])"
+  + "|(?<![\\w-])color\\s*:\\s*(?:#fff(?:fff)?\\b|white\\b|rgba?\\(\\s*255\\s*,\\s*255\\s*,\\s*255)"
+  + "|(?:left|top|text-indent)\\s*:\\s*-\\d{3,})[^\"']*[\"']"
+  + "|class\\s*=\\s*[\"'][^\"']*\\b(?:hidden|invisible|sr-only|visually-hidden|d-none)\\b[^\"']*[\"'])[^>]*>"
+  + "(?<body>[\\s\\S]*?)</\\k<tag>\\s*>", "gi");
+const TAGS = /<[^>]+>/g;
+
+// [text without invisible characters, index map back into text]
+function visible(text) {
+  const chars = [];
+  const index = [];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\uDB40" && i + 1 < text.length && text.charCodeAt(i + 1) >= 0xDC00 && text.charCodeAt(i + 1) <= 0xDC7F) {
+      i += 1;
+      continue;
+    }
+    if (INVISIBLE_CHARS.indexOf(ch) !== -1) continue;
+    chars.push(ch);
+    index.push(i);
+  }
+  return [chars.join(""), index];
+}
+
+function instructionSpans(text) {
+  return spansOf(INSTRUCTION, text)
+    .concat(phraseSpans(text).map((s) => [s[0], s[1]]))
+    .concat(spansOf(SHELL, text));
+}
+
+function hiddenSpans(text) {
+  const spans = [];
+  let start = text.indexOf("<!--");
+  while (start !== -1) {
+    const end = text.indexOf("-->", start + 4);
+    if (end === -1) break;
+    const body = text.slice(start + 4, end);
+    if (isInstruction(visible(body)[0])) spans.push([start, end + 3, body.trim()]);
+    start = text.indexOf("<!--", end + 3);
+  }
+  for (const m of matches(HIDDEN_ELEMENT, text)) {
+    const body = visible(m.groups.body.replace(TAGS, " "))[0];
+    if (isInstruction(body)) spans.push([m.index, m.index + m[0].length, body.trim()]);
+  }
+  for (const m of matches(TAG_RUN, text)) {
+    let decoded = "";
+    for (let i = 1; i < m[0].length; i += 2) {
+      const c = m[0].charCodeAt(i) - 0xDC00;
+      if (c >= 0x20 && c <= 0x7e) decoded += String.fromCharCode(c);
+    }
+    if (isInstruction(decoded)) spans.push([m.index, m.index + m[0].length, decoded]);
+  }
+  if (INVISIBLE_RE.test(text)) {
+    const [vis, index] = visible(text);
+    for (const [s, e] of instructionSpans(vis)) {
+      const oStart = index[s];
+      const oEnd = index[e - 1] + 1;
+      if (INVISIBLE_RE.test(text.slice(oStart, oEnd))) spans.push([oStart, oEnd, vis.slice(s, e)]);
+    }
+  }
+  return spans;
+}
+
+function bySpan(a, b) {
+  return a[0] - b[0] || a[1] - b[1];
+}
+
+/** The instructions hidden in text (HTML comments, invisible elements, zero-width or Unicode tag characters), made readable. */
+export function findHiddenPrompts(text) {
+  if (typeof text !== "string" || !text) return [];
+  return hiddenSpans(text).sort(bySpan).map((s) => s[2]);
+}
+
+/** text with each hidden instruction replaced by <hidden_prompts_removed>; same type in, same type out. */
+export function removeHiddenPrompts(text) {
+  if (typeof text !== "string") return structured(text, removeHiddenPrompts);
+  const spans = hiddenSpans(text);
+  return spans.length ? replaceSpans(text, spans, "<hidden_prompts_removed>") : text;
+}
+
+// Encoded: base64 (standard or URL-safe, padded or not), hex, percent-encoding and ROT13,
+// up to two layers; a span is removed only when its decoded text is an instruction.
+const B64_TOKEN = /(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/=_-])/g;
+const HEX_TOKEN = /(?<![0-9A-Fa-f])(?:\\x)?(?:[0-9A-Fa-f]{2}(?:\\x)?){8,}(?![0-9A-Fa-f])/g;
+const PCT_TOKEN = /(?<![^\s"'<>])[^\s"'<>%]*%[0-9A-Fa-f]{2}[^\s"'<>]*/g;
+const JOINED_STRINGS = /^["']\s*\+\s*["']$/;
+
+function rot13(text) {
+  return text.replace(/[A-Za-z]/g, (c) => {
+    const base = c <= "Z" ? 65 : 97;
+    return String.fromCharCode((c.charCodeAt(0) - base + 13) % 26 + base);
+  });
+}
+
+function printable(decoded) {
+  if (!decoded) return false;
+  const chars = Array.from(decoded);
+  return chars.filter(isPrintableOrSpace).length >= 0.95 * chars.length;
+}
+
+function utf8(bytes) {
+  try {
+    if (typeof TextDecoder === "undefined") return null;
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (e) {
+    return null;
+  }
+}
+
+// Readable text token decodes to (base64 / hex / percent), else null.
+function decodeToken(token) {
+  const raw = token.split("\\x").join("");
+  if (token.indexOf("%") !== -1) {
+    if ((token.match(/%[0-9A-Fa-f]{2}/g) || []).length < 4) return null;
+    let decoded;
+    try {
+      decoded = decodeURIComponent(token);
+    } catch (e) {
+      return null;
+    }
+    return decoded !== token && printable(decoded) ? decoded : null;
+  }
+  if (/^(?:[0-9A-Fa-f]{2}){8,}$/.test(raw)) {
+    const bytes = new Uint8Array(raw.length / 2);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(raw.substr(i * 2, 2), 16);
+    const decoded = utf8(bytes);
+    if (decoded !== null && printable(decoded)) return decoded;
+  }
+  const body = token.replace(/=+$/, "").replace(/-/g, "+").replace(/_/g, "/");
+  if (body.length % 4 === 1 || !/^[A-Za-z0-9+/]+$/.test(body)) return null;
+  const decoded = decodeBase64(body + "=".repeat((4 - (body.length % 4)) % 4));
+  return decoded !== null && printable(decoded) ? decoded : null;
+}
+
+function decodedInstruction(decoded, depth) {
+  depth = depth || 1;
+  if (isInstruction(decoded)) return decoded;
+  if (depth < 2) {
+    for (const rx of [B64_TOKEN, HEX_TOKEN, PCT_TOKEN]) {
+      for (const m of matches(rx, decoded)) {
+        const inner = decodeToken(m[0]);
+        if (inner && decodedInstruction(inner, depth + 1)) return inner;
+      }
+    }
+  }
+  return null;
+}
+
+function encodedSpansWide(text) {
+  const spans = [];
+  const pieces = [];
+  for (const rx of [B64_TOKEN, HEX_TOKEN, PCT_TOKEN]) {
+    for (const m of matches(rx, text)) {
+      const decoded = decodeToken(m[0]);
+      if (decoded === null) continue;
+      const end = m.index + m[0].length;
+      pieces.push([m.index, end, decoded]);
+      const found = decodedInstruction(decoded);
+      if (found) spans.push([m.index, end, found]);
+    }
+  }
+  // A payload split over concatenated string literals ("SWdu..." + "aW5z...").
+  pieces.sort(bySpan);
+  for (let i = 0; i < pieces.length - 1; i++) {
+    const a = pieces[i];
+    const b = pieces[i + 1];
+    const gap = text.slice(a[1], b[0]).trim();
+    if (JOINED_STRINGS.test(gap) || !gap) {
+      const joined = a[2] + b[2];
+      if (isInstruction(joined) && !(isInstruction(a[2]) && isInstruction(b[2]))) spans.push([a[0], b[1], joined]);
+    }
+  }
+  for (const [lineStart, line] of linesWithOffsets(text)) {
+    const rotated = rot13(line);
+    for (const [s, e] of instructionSpans(rotated)) {
+      if (!instructionSpans(line.slice(s, e)).length) spans.push([lineStart + s, lineStart + e, rotated.slice(s, e)]);
+    }
+  }
+  return spans;
+}
+
+/** The decoded instructions found in text (empty array: none). */
+export function findEncodedPrompts(text) {
+  if (typeof text !== "string" || !text) return [];
+  return encodedSpansWide(text).sort(bySpan).map((s) => s[2]);
+}
+
+/** text with each encoded instruction (base64, URL-safe base64, hex, percent, ROT13) replaced by <encoded_prompts_removed>. */
+export function removeEncodedPrompts(text) {
+  if (typeof text !== "string") return structured(text, removeEncodedPrompts);
+  const spans = encodedSpansWide(text);
+  return spans.length ? replaceSpans(text, spans, "<encoded_prompts_removed>") : text;
+}
+
+// Leetspeak: each letter also matches its usual substitutes (1 ! | for i and l, 3 for e,
+// 0 for o, 4 @ for a, 5 $ for s, 7 + for t ...); letters may be spaced out, with a wider
+// gap between words. A match of this wider list counts only if it uses a substitute or
+// spaced letters; the plain phrases sanitizePrompt removes are removed too.
+const LEET_LETTERS = { a: "a4@", b: "b8", e: "e3", g: "g96", i: "i1!|l", l: "l1|i", o: "o0", s: "s5$", t: "t7+", z: "z2" };
+
+function leetWord(word) {
+  return Array.from(word).map((ch) => "[" + (LEET_LETTERS[ch] || ch).replace(/[\\\]^-]/g, "\\$&") + "]").join(" ?");
+}
+
+function leetAny(words) {
+  return "(?:" + words.slice().sort((a, b) => b.length - a.length).map(leetWord).join("|") + ")";
+}
+
+const GAP = "\\s+";
+const LEET_PROMPT = new RegExp(
+  leetAny(["ignore", "disregard", "forget", "override", "bypass"]) + GAP
+  + "(?:" + leetAny(["all", "any", "the", "your", "my", "previous", "prior", "above", "earlier",
+                     "safety", "system", "original"]) + GAP + "){0,3}"
+  + leetAny(["instructions", "instruction", "rules", "guidelines", "restrictions", "prompt",
+             "prompts", "filters", "policies", "policy"])
+  + "|" + leetAny(["you"]) + GAP + leetAny(["are"]) + GAP + leetAny(["now"]) + GAP
+  + "(?:" + leetAny(["in", "an", "a"]) + GAP + ")?"
+  + leetAny(["dan", "unrestricted", "unfiltered", "jailbroken", "evil", "developer", "admin", "god"])
+  + "|" + leetAny(["reveal", "print", "show", "dump", "leak", "send"]) + GAP
+  + "(?:" + leetAny(["the", "your", "all", "me"]) + GAP + "){0,2}"
+  + leetAny(["system", "secrets", "secret", "passwords", "password", "credentials", "api"])
+  + "(?:" + GAP + leetAny(["prompt", "keys", "key"]) + ")?",
+  "gi");
+const LEET_MARK = /[0-9@$!|+]|(?<![A-Za-z])[A-Za-z] [A-Za-z] [A-Za-z](?![A-Za-z])/;
+
+function leetspeakSpans(text) {
+  const spans = phraseSpans(text).map(([s, e]) => [s, e, text.slice(s, e)]);
+  for (const [lineStart, line] of linesWithOffsets(text)) {
+    for (const m of matches(LEET_PROMPT, line)) {
+      // The rest of the line belongs to the same instruction ("... 4nd r3v34l ...").
+      if (LEET_MARK.test(m[0])) spans.push([lineStart + m.index, lineStart + line.trimEnd().length, m[0]]);
+    }
+    const folded = foldLeet(line);
+    if (folded !== line && hasShell(folded) && !hasShell(line)) {
+      const lead = line.length - line.replace(/^\s+/, "").length;
+      spans.push([lineStart + lead, lineStart + line.trimEnd().length, folded.trim()]);
+    }
+  }
+  return spans;
+}
+
+/** The leetspeak or letter-spaced instructions found in text (empty array: none). */
+export function findLeetspeakPrompts(text) {
+  if (typeof text !== "string" || !text) return [];
+  return leetspeakSpans(text).sort(bySpan).map(([s, e]) => text.slice(s, e));
+}
+
+/** text with each leetspeak or letter-spaced instruction (and the plain phrases sanitizePrompt removes) replaced by <leetspeak_prompts_removed>. */
+export function removeLeetspeakPrompts(text) {
+  if (typeof text !== "string") return structured(text, removeLeetspeakPrompts);
+  const spans = leetspeakSpans(text);
+  return spans.length ? replaceSpans(text, spans, "<leetspeak_prompts_removed>") : text;
+}
+
+// Command requests (AI_APP_SEC_059): a request to run a shell command or code with a
+// target. A word or file name on its own (exec, bash, setup.sh) or a question about one
+// is not a request.
+const RUN_VERB = "\\b(?:run|execute|exec|eval|evaluate|launch)\\b\\s*:?\\s*[`\"']?";
+const COMMAND_REQUEST = [
+  ["shell_command", new RegExp(RUN_VERB + CMD, "gi")],
+  ["shell_command", new RegExp(RUN_VERB + "(?:sudo\\s+)?(?:bash|sh|zsh|ksh|python3?|node|perl|ruby|php|"
+                               + "powershell|pwsh|cmd)\\s+(?:-\\w+\\s+)?\\S", "gi")],
+  ["code_execution", new RegExp(RUN_VERB + "[\\w.]+\\([^)\\n]*\\)", "g")],
+  ["secret_access", new RegExp(
+    "\\b(?:cat|type|print|echo|read|dump|show|send)\\b[^\\n]{0,40}"
+    + "(?:/etc/(?:passwd|shadow)|os\\.environ|process\\.env|\\.ssh/|\\.aws/credentials|\\$[A-Z_]*(?:KEY|TOKEN|SECRET))",
+    "gi")]
+];
+
+function commandRequestSpans(text) {
+  const spans = [];
+  for (const [category, pattern] of COMMAND_REQUEST) {
+    for (const m of matches(pattern, text)) spans.push([m.index, m.index + m[0].length, category]);
+  }
+  return spans;
+}
+
+function commandFindings(text, found) {
+  for (const s of commandRequestSpans(text)) found.add(s[2]);
+  if (matches(SHELL, text).length) found.add("shell_command");
+  for (const name of findCodeExecution(text)) found.add(name === "pipe_to_shell" ? "pipe_to_shell" : "code_execution");
+}
+
+/**
+ * The kinds of command-execution request in value (empty array: none): shell commands,
+ * code execution, piping a download into a shell, reading secrets; also when the request
+ * is hidden, encoded or written in leetspeak. Accepts a string, a list of chat messages or
+ * an object. The caller refuses the request (HTTP 400) and logs a fingerprint of it,
+ * never the text.
+ */
+export function findCommandRequests(value) {
+  const pieces = [];
+  if (typeof value === "string") pieces.push(value);
+  else structured(value, (s) => { pieces.push(s); return s; });
+  const found = new Set();
+  for (const piece of pieces) {
+    if (!piece) continue;
+    const variants = [piece, visible(piece)[0], foldLeet(piece)]
+      .concat(hiddenSpans(piece).map((s) => s[2]))
+      .concat(encodedSpansWide(piece).map((s) => s[2]));
+    for (const variant of variants) commandFindings(variant, found);
+  }
+  return Array.from(found).sort();
+}
+'''
+_UNIFAI_GUARD_DTS_SOURCE = r'''// Types for unifaiGuard.js, the prompt-injection and PII guard added by Lineaje UnifAI remediation.
+// UNIFAI-GUARD owner="Lineaje UnifAI": generated by UnifAI remediation scans; do not edit.
+
+export declare const UNIFAI_GUARD_MANIFEST: {
+  owner: string;
+  version: string;
+  routines: Record<string, string[]>;
+};
+export declare const VERSION: string;
+
+/** Attack categories found in text (empty array: none). */
+export declare function findPromptAttacks(text: unknown): string[];
+
+/** text with prompt-injection spans replaced by a marker; anything else unchanged. */
+export declare function sanitizePrompt<T>(text: T): T;
+
+/** A copy of a chat message list with sanitizePrompt applied to the given roles. */
+export declare function sanitizeMessages<T>(messages: T, roles?: readonly string[]): T;
+
+/** The policy categories this guard has no text detector for (they are not redacted). */
+export declare function unsupportedPiiCategories(categories: string | readonly string[]): string[];
+
+/** text with the personal data of the given policy categories replaced by <redacted:category>. */
+export declare function redactPii<T>(text: T, categories: string | readonly string[]): T;
+
+/** The dynamic code-execution primitives found in model output (empty array: none). */
+export declare function findCodeExecution(text: unknown): string[];
+
+/** text with PII masked for display: identifiers keep their last 4 digits, others become <masked:label>. */
+export declare function maskPii<T>(text: T, categories: string | readonly string[]): T;
+
+/** The shell-command lines found in uploaded or fetched content (empty array: none). */
+export declare function findShellCommands(text: unknown): string[];
+
+/** Uploaded or fetched content with each shell command replaced by <suspicious_content_removed>. */
+export declare function removeSuspiciousContent<T>(text: T): T;
+
+/** The instructions hidden in text (HTML comments, invisible elements, zero-width or Unicode tag characters), made readable. */
+export declare function findHiddenPrompts(text: unknown): string[];
+
+/** text with each hidden instruction replaced by <hidden_prompts_removed>; same type in, same type out. */
+export declare function removeHiddenPrompts<T>(text: T): T;
+
+/** The decoded instructions found in text (base64, URL-safe base64, hex, percent, ROT13). */
+export declare function findEncodedPrompts(text: unknown): string[];
+
+/** text with each encoded instruction replaced by <encoded_prompts_removed>; same type in, same type out. */
+export declare function removeEncodedPrompts<T>(text: T): T;
+
+/** The leetspeak or letter-spaced instructions found in text (empty array: none). */
+export declare function findLeetspeakPrompts(text: unknown): string[];
+
+/** text with each leetspeak or letter-spaced instruction replaced by <leetspeak_prompts_removed>; same type in, same type out. */
+export declare function removeLeetspeakPrompts<T>(text: T): T;
+
+/** The kinds of command-execution request in a prompt, chat message list or object (empty array: none); refuse the request when any is found. */
+export declare function findCommandRequests(value: unknown): string[];
 '''
 # --- END UNIFAI_GUARD_SOURCE ---
 
@@ -1896,6 +3665,159 @@ def _add_missing_stdlib_imports(content: str, original_content: str) -> Tuple[st
     return content, still
 
 
+# ---------------------------------------------------------------------------
+# C-38 NEW-30 (Wega PR #93): a fix may not import a module the app does not have.
+# ``from lineaje_guardrail import lineaje_guardrail`` (no such module anywhere)
+# stopped the backend at startup. Same rule as ``unifai_verify/import_gate.py``,
+# judged against the checked-out repo: a newly imported module must be stdlib,
+# the shared guard, a repo module or package, a module the app already imports,
+# or a declared dependency.
+_IMPORT_SKIP_DIRS = frozenset({
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "env", ".tox", "site-packages", ".lineaje",
+})
+_IMPORT_ALWAYS = frozenset({"__future__", "unifai_guard"})
+_DIST_IMPORT_ALIASES = {
+    "pyyaml": "yaml", "python_dotenv": "dotenv", "scikit_learn": "sklearn", "pillow": "PIL",
+    "beautifulsoup4": "bs4", "opencv_python": "cv2", "opencv_python_headless": "cv2",
+    "python_multipart": "multipart", "protobuf": "google", "python_jose": "jose", "pyjwt": "jwt",
+    "python_docx": "docx", "python_pptx": "pptx", "pymupdf": "fitz", "attrs": "attr",
+    "psycopg2_binary": "psycopg2", "pycryptodome": "Crypto", "google_generativeai": "google",
+    "google_cloud_storage": "google", "dnspython": "dns", "python_dateutil": "dateutil",
+    "faiss_cpu": "faiss", "faiss_gpu": "faiss", "pypdf2": "PyPDF2",
+    "office365_rest_python_client": "office365", "azure_ai_formrecognizer": "azure",
+}
+_DEP_MANIFEST = re.compile(r"^(?:requirements[^/]*\.txt|pyproject\.toml|setup\.py|setup\.cfg|Pipfile)$")
+_REQ_LINE_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+_QUOTED_REQ_NAME = re.compile(r"""["']([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(?:[<>=!~;@ ]|["'])""")
+_REPO_MODULES: Dict[str, set] = {}
+
+
+def _norm_module(name: str) -> str:
+    return re.sub(r"[-_.]+", "_", name).lower()
+
+
+def _top_imports(source: str) -> Optional[Dict[str, int]]:
+    """Top-level module of each absolute import in *source* → first line; None if it doesn't parse."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    out: Dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                out.setdefault(alias.name.split(".")[0], node.lineno)
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            out.setdefault(node.module.split(".")[0], node.lineno)
+    return out
+
+
+def _declared_deps(filename: str, text: str) -> set:
+    names: set = set()
+    if filename.endswith(".txt"):
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            m = _REQ_LINE_NAME.match(line) if line and not line.startswith("-") else None
+            if m:
+                names.add(_norm_module(m.group(1)))
+    else:
+        names.update(_norm_module(m.group(1)) for m in _QUOTED_REQ_NAME.finditer(text))
+        if filename == "Pipfile":
+            for line in text.splitlines():
+                m = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*=", line)
+                if m:
+                    names.add(_norm_module(m.group(1)))
+    return names | {_norm_module(_DIST_IMPORT_ALIASES[n]) for n in names if n in _DIST_IMPORT_ALIASES}
+
+
+def _repo_known_modules(source_dir: str) -> set:
+    """Normalised names a fix may import in the checked-out repo (cached per checkout)."""
+    key = os.path.realpath(source_dir)
+    if key in _REPO_MODULES:
+        return _REPO_MODULES[key]
+    known: set = set()
+    for root, dirs, files in os.walk(source_dir):
+        dirs[:] = [d for d in dirs if d not in _IMPORT_SKIP_DIRS]
+        rel_root = os.path.relpath(root, source_dir)
+        if rel_root != ".":
+            known.update(_norm_module(p) for p in rel_root.replace("\\", "/").split("/") if p)
+        for fn in files:
+            stem, ext = os.path.splitext(fn)
+            if ext in (".py", ".pyi", ".so", ".pyd"):
+                known.add(_norm_module(stem))
+            if ext != ".py" and not _DEP_MANIFEST.match(fn):
+                continue
+            try:
+                path = os.path.join(root, fn)
+                if os.path.getsize(path) > 2_000_000:
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if ext == ".py":
+                known.update(_norm_module(m) for m in (_top_imports(text) or {}))
+            if _DEP_MANIFEST.match(fn):
+                known.update(_declared_deps(fn, text))
+    _REPO_MODULES[key] = known
+    return known
+
+
+def _unresolved_new_imports(content: str, original: str, source_dir: str) -> List[str]:
+    """Modules *content* newly imports that the repo does not have (sorted)."""
+    new = _top_imports(content)
+    if not new:
+        return []
+    old = _top_imports(original) or {}
+    stdlib = frozenset(getattr(sys, "stdlib_module_names", ())) | frozenset(sys.builtin_module_names)
+    candidates = [m for m in new if m not in old and m not in stdlib and m not in _IMPORT_ALWAYS]
+    if not candidates:
+        return []
+    known = _repo_known_modules(source_dir)
+    return sorted(m for m in candidates if _norm_module(m) not in known)
+
+
+def _drop_unresolved_imports(content: str, original: str, source_dir: str, rel: str) -> Tuple[str, List[str]]:
+    """(content, modules still unresolved). A module-level import of a module the repo
+    does not have, whose names the file never uses, is removed: it could only stop the
+    app at startup. One the code uses is kept and returned, so the caller drops the
+    fixes that use it."""
+    missing = _unresolved_new_imports(content, original, source_dir)
+    if not missing:
+        return content, []
+    tree = ast.parse(content)
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    lines = content.splitlines(keepends=True)
+    removed: List[str] = []
+    for node in reversed(tree.body):
+        if isinstance(node, ast.Import):
+            mods = [a.name.split(".")[0] for a in node.names]
+            bound = [a.asname or a.name.split(".")[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            mods = [node.module.split(".")[0]]
+            bound = [a.asname or a.name for a in node.names]
+        else:
+            continue
+        if not all(m in missing for m in mods) or any(b in used for b in bound):
+            continue
+        start, end = node.lineno - 1, (node.end_lineno or node.lineno)
+        stmt = "".join(lines[start:end]).strip()
+        if not stmt.startswith(("import ", "from ")) or ";" in stmt:
+            continue
+        del lines[start:end]
+        removed.append(stmt)
+    if removed:
+        content = "".join(lines)
+        logger.warning(
+            "Removed from the fix for %s an import of a module that does not exist (it would stop the app "
+            "at startup): %s", rel, " | ".join(reversed(removed)),
+        )
+    still = _unresolved_new_imports(content, original, source_dir)
+    if still:
+        logger.warning("Fix for %s imports module(s) that do not exist: %s", rel, ", ".join(still))
+    return content, still
+
+
 def _checked_server_content(rel: str, new_content: str, source_dir: str) -> Optional[str]:
     """Server-sent whole-file content for *rel*, or None when committing it
     would leave a Python file that can't be imported: a SyntaxError, or a name
@@ -1923,6 +3845,12 @@ def _checked_server_content(rel: str, new_content: str, source_dir: str) -> Opti
     if undefined:
         logger.warning(
             "Skipped remediation for %s — it uses undefined name(s): %s", rel, ", ".join(undefined),
+        )
+        return None
+    content, missing = _drop_unresolved_imports(content, original, source_dir, rel)
+    if missing:
+        logger.warning(
+            "Skipped remediation for %s — it imports module(s) that do not exist: %s", rel, ", ".join(missing),
         )
         return None
     return content
@@ -2275,7 +4203,8 @@ def parallel_batch_scan(
     all_aibom: List[Dict[str, str]] = []
     all_stub_insertions: List[Dict[str, Any]] = []
     # What the server PUT to Lineaje S3, plus whether any batch's source archive went too.
-    uploaded: Dict[str, Any] = {"entities": [], "findings": [], "source_archive_s3_uploaded": None}
+    uploaded: Dict[str, Any] = {"entities": [], "findings": [], "source_archive_s3_uploaded": None,
+                                "shared_guard": None}
     aibom_seen: set = set()
     failed_batch_count = 0
     failure_details: List[str] = []
@@ -2371,6 +4300,8 @@ def parallel_batch_scan(
                 all_reports.append(batch_report)
             uploaded["entities"].extend(mcp_result.get("uploaded_entities_json") or [])
             uploaded["findings"].extend(mcp_result.get("uploaded_findings_json") or [])
+            if isinstance(mcp_result.get("shared_guard"), dict) and not uploaded["shared_guard"]:
+                uploaded["shared_guard"] = mcp_result["shared_guard"]
             src_flag = mcp_result.get("source_archive_s3_uploaded")
             if src_flag is not None:
                 uploaded["source_archive_s3_uploaded"] = bool(
@@ -3249,6 +5180,11 @@ def apply_pipeline_fix_code_to_clone(
             undefined: List[str] = []
             if applied and content != original_content and check_python:
                 content, undefined = _add_missing_stdlib_imports(content, original_content)
+                if not undefined:
+                    # C-38 NEW-30: an unused import of a missing module is removed; a
+                    # used one drops the fixes that use it, like an undefined name.
+                    content, undefined = _drop_unresolved_imports(
+                        content, original_content, source_dir, rel_path)
             if not undefined:
                 break
             # Drop only the fixes that use the undefined names — typically a helper
@@ -3349,17 +5285,18 @@ def _build_fix_pr_body(
         "LLM-suggested fixes for review — merge only what you accept.",
     ])
     failed = failed_files or []
-    remediation = "\n".join([
-        "## Remediation changes",
-        "",
-        f"### Files remediated ({len(committed)})",
-        "",
-        "\n".join(f"- `{f}`" for f in committed),
-        "",
-        f"### Files without fixes ({len(failed)})",
-        "",
-        "\n".join(f"- `{f}`" for f in failed) or "_None_",
-    ])
+    if failed:
+        # User decision (2026-10-05): when any flagged file has no fix, the PR does not
+        # list the files with and without fixes; the per-file details below remain.
+        remediation = "## Remediation changes"
+    else:
+        remediation = "\n".join([
+            "## Remediation changes",
+            "",
+            f"### Files remediated ({len(committed)})",
+            "",
+            "\n".join(f"- `{f}`" for f in committed),
+        ])
     details = _pr_remediation_details(fix_table, limit // 3)
     if details:
         remediation += "\n\n" + details
@@ -3485,7 +5422,8 @@ class _GitHubClient:
 
 
 def _is_guard_file(path: str) -> bool:
-    return os.path.basename(path) == _GUARD_FILENAME
+    return os.path.basename(path) in (_GUARD_FILENAME, "unifaiGuard.js", "unifaiGuard.cjs",
+                                      "unifaiGuard.mjs", "unifaiGuard.d.ts")
 
 
 def _commit_with_retry(scm: "_GitHubClient", repo: str, branch: str, filepath: str, content: str,
@@ -3900,6 +5838,8 @@ def _execute_scan(args: argparse.Namespace) -> int:
             row for row in fix_table
             if _norm_stub_relpath(row.get("file") or "") not in gated_paths
         ]
+    if validated_fixes:
+        _use_server_guard(uploaded.get("shared_guard"))
     failed_rem_files.extend(_add_shared_guard_files(validated_fixes, source_path, fix_table))
 
     fix_branch_name = (getattr(args, "fix_branch", None) or "").strip()
