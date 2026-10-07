@@ -17,8 +17,36 @@ from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+from unifai_guard import sanitize_prompt, find_prompt_attacks, redact_pii, mask_pii, sanitize_messages, find_code_execution, remove_suspicious_content, remove_hidden_prompts, remove_encoded_prompts, remove_leetspeak_prompts, find_command_requests
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_untrusted_text(text: str) -> str:
+    text = redact_pii(text, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation', 'aws_access_key_id', 'aws_secret_access_key', 'gcp_service_account_key', 'azure_client_secret', 'private_key', 'password', 'api_key', 'oauth_token'))
+    text = remove_hidden_prompts(text)
+    text = remove_encoded_prompts(text)
+    text = remove_leetspeak_prompts(text)
+    text = sanitize_prompt(text)
+    return text
+
+
+def _sanitize_untrusted_document_text(text: str) -> str:
+    text = redact_pii(text, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation'))
+    text = remove_suspicious_content(text)
+    text = remove_hidden_prompts(text)
+    text = remove_encoded_prompts(text)
+    text = remove_leetspeak_prompts(text)
+    text = sanitize_prompt(text)
+    return text
+
+
+def _remove_unsafe_response_lines(text: str) -> str:
+    if not find_code_execution(text):
+        return text
+
+    safe_lines = [line for line in text.splitlines() if not find_code_execution(line)]
+    return "\n".join(safe_lines)
 
 
 class BedrockClient:
@@ -96,6 +124,11 @@ class BedrockClient:
         if not active_region:
             return "LLM service not configured. Please set AWS_REGION or AWS_DEFAULT_REGION."
 
+        messages = redact_pii(messages, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation', 'aws_access_key_id', 'aws_secret_access_key', 'gcp_service_account_key', 'azure_client_secret', 'private_key', 'password', 'api_key', 'oauth_token'))
+        messages = remove_hidden_prompts(messages)
+        messages = remove_encoded_prompts(messages)
+        messages = remove_leetspeak_prompts(messages)
+        messages = sanitize_messages(messages)
         bedrock_messages, system_prompts = self._format_messages(messages)
 
         logger.info(
@@ -108,7 +141,6 @@ class BedrockClient:
                     len(str(message.get("content", ""))) for message in messages
                 ),
                 # VULNERABILITY: Message content in logs
-                "messages_preview": str(messages)[:200],
             },
         )
 
@@ -123,13 +155,13 @@ class BedrockClient:
             )
 
             content = self._extract_text(response)
+            content = _remove_unsafe_response_lines(content)
 
             logger.info(
                 "Received response from Amazon Bedrock",
                 extra={
                     "response_length": len(content),
                     # VULNERABILITY: Full response in logs
-                    "response_preview": content[:200],
                 },
             )
 
@@ -207,7 +239,9 @@ class BedrockClient:
             for block in content_blocks
             if isinstance(block, dict) and block.get("text")
         ]
-        return "\n".join(text_parts).strip()
+        content = "\n".join(text_parts).strip()
+        content = _remove_unsafe_response_lines(content)
+        return content
 
     async def chat_with_context(
         self,
@@ -223,6 +257,8 @@ class BedrockClient:
         messages = [{"role": "system", "content": system_prompt}]
 
         if context:
+            context = _sanitize_untrusted_document_text(context)
+            user_message = _sanitize_untrusted_text(user_message)
             # VULNERABILITY: Context added without scanning
             messages.append(
                 {
@@ -231,8 +267,14 @@ class BedrockClient:
                 }
             )
         else:
+            user_message = _sanitize_untrusted_text(user_message)
             messages.append({"role": "user", "content": user_message})
 
+        messages = redact_pii(messages, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation', 'aws_access_key_id', 'aws_secret_access_key', 'gcp_service_account_key', 'azure_client_secret', 'private_key', 'password', 'api_key', 'oauth_token'))
+        messages = remove_hidden_prompts(messages)
+        messages = remove_encoded_prompts(messages)
+        messages = remove_leetspeak_prompts(messages)
+        messages = sanitize_messages(messages)
         return await self.chat(messages)
 
     async def analyze_document(self, content: str) -> str:
@@ -242,6 +284,7 @@ class BedrockClient:
         VULNERABILITY: Document content sent directly to LLM
         without PII scanning or threat detection.
         """
+        content = _sanitize_untrusted_document_text(content)
         # VULNERABILITY: No pre-LLM security checks
         return await self.chat_with_context(
             user_message="Please analyze this document and provide a summary.",
