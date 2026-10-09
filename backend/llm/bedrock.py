@@ -17,8 +17,21 @@ from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+from unifai_guard import sanitize_prompt, find_prompt_attacks, redact_pii, mask_pii, sanitize_messages, find_code_execution, remove_suspicious_content, remove_hidden_prompts, remove_encoded_prompts, remove_leetspeak_prompts, find_command_requests
 
 logger = logging.getLogger(__name__)
+
+
+def _remove_unsafe_response_lines(text: str) -> str:
+    unsafe_lines: list[str] = []
+    for line in text.splitlines():
+        if find_code_execution(line):
+            unsafe_lines.append(line)
+
+    if not unsafe_lines:
+        return text
+
+    return "\n".join(line for line in text.splitlines() if line not in unsafe_lines)
 
 
 class BedrockClient:
@@ -96,6 +109,11 @@ class BedrockClient:
         if not active_region:
             return "LLM service not configured. Please set AWS_REGION or AWS_DEFAULT_REGION."
 
+        messages = sanitize_messages(messages)
+        messages = remove_hidden_prompts(messages)
+        messages = remove_encoded_prompts(messages)
+        messages = remove_leetspeak_prompts(messages)
+        messages = redact_pii(messages, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation', 'aws_access_key_id', 'aws_secret_access_key', 'gcp_service_account_key', 'azure_client_secret', 'private_key', 'password', 'api_key', 'oauth_token'))
         bedrock_messages, system_prompts = self._format_messages(messages)
 
         logger.info(
@@ -108,7 +126,7 @@ class BedrockClient:
                     len(str(message.get("content", ""))) for message in messages
                 ),
                 # VULNERABILITY: Message content in logs
-                "messages_preview": str(messages)[:200],
+                "messages_preview": str(mask_pii(messages, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation')))[:200],
             },
         )
 
@@ -123,13 +141,15 @@ class BedrockClient:
             )
 
             content = self._extract_text(response)
+            if find_code_execution(content):
+                content = _remove_unsafe_response_lines(content)
 
             logger.info(
                 "Received response from Amazon Bedrock",
                 extra={
                     "response_length": len(content),
                     # VULNERABILITY: Full response in logs
-                    "response_preview": content[:200],
+                    "response_preview": mask_pii(content, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation'))[:200],
                 },
             )
 
@@ -222,7 +242,18 @@ class BedrockClient:
         """
         messages = [{"role": "system", "content": system_prompt}]
 
+        user_message = sanitize_prompt(user_message)
+        user_message = remove_hidden_prompts(user_message)
+        user_message = remove_encoded_prompts(user_message)
+        user_message = remove_leetspeak_prompts(user_message)
+        user_message = redact_pii(user_message, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation', 'aws_access_key_id', 'aws_secret_access_key', 'gcp_service_account_key', 'azure_client_secret', 'private_key', 'password', 'api_key', 'oauth_token'))
         if context:
+            context = redact_pii(context, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation'))
+            context = remove_suspicious_content(context)
+            context = sanitize_prompt(context)
+            context = remove_hidden_prompts(context)
+            context = remove_encoded_prompts(context)
+            context = remove_leetspeak_prompts(context)
             # VULNERABILITY: Context added without scanning
             messages.append(
                 {
@@ -242,6 +273,12 @@ class BedrockClient:
         VULNERABILITY: Document content sent directly to LLM
         without PII scanning or threat detection.
         """
+        content = redact_pii(content, categories=('ssn', 'year_of_birth', 'birthplace', 'phone', 'email', 'mothers_maiden_name', 'home_address', 'passport_number', 'drivers_license_number', 'taxpayer_id', 'credit_card', 'financial_account_number', 'fingerprints', 'retina_iris_scan', 'voice_signature', 'facial_image', 'medical_records', 'employee_id', 'school_id', 'vehicle_identification_number', 'ip_address', 'mac_address', 'fine_location', 'ethnicity', 'sexual_orientation'))
+        content = remove_suspicious_content(content)
+        content = sanitize_prompt(content)
+        content = remove_hidden_prompts(content)
+        content = remove_encoded_prompts(content)
+        content = remove_leetspeak_prompts(content)
         # VULNERABILITY: No pre-LLM security checks
         return await self.chat_with_context(
             user_message="Please analyze this document and provide a summary.",
