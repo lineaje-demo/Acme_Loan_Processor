@@ -14,7 +14,6 @@ permissions:
 
 jobs:
   lineaje-scan:
-    runs-on: [self-hosted, lineaje-ai-vm]
 
     steps:
       - name: Checkout repository
@@ -48,5 +47,5 @@ jobs:
             --repo ${{ github.repository }} \
             --branch ${{ github.ref_name }} \
             --head-sha ${{ github.sha }} \
-            --mcp-server-url https://localhost/mcp \
+            --mcp-server-url https://mcp-code.v2.prod.veedna.com/mcp \
             ${{ inputs.create_fix_pr && '--create-fix-pr' || '' }} >> "$GITHUB_STEP_SUMMARY"
