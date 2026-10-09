@@ -1,41 +1,12 @@
-name: Lineaje AI Scan
+name: Lineaje UnifAI Scan
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-
   workflow_dispatch:
     inputs:
-      scan_mode:
-        description: "Scan the whole repo, a folder, or a single file"
-        type: choice
-        options: [repo, folder, file]
-        default: repo
-
-      target_repo:
-        description: "owner/repo to scan (blank = this repo)"
-        required: false
-        default: ""
-
-      ref:
-        description: "Branch, tag, or SHA to scan (blank = default branch)"
-        required: false
-        default: ""
-
-      file_path:
-        description: "Path to a single file to scan (scan_mode=file only)"
-        required: false
-        default: ""
-
-      folder_path:
-        description: "Path to a folder to scan (scan_mode=folder only)"
-        required: false
-        default: ""
-
       create_fix_pr:
-        description: "Open a remediation PR with auto-fixes"
+        description: "Open a remediation PR with the remediation suggestions"
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
@@ -43,155 +14,11 @@ permissions:
 
 jobs:
   lineaje-scan:
-    # Defense in depth:
-    # remediation PRs created by this scanner should never scan themselves.
-    if: >-
-      ${{
-        github.event_name != 'pull_request' ||
-        !startsWith(github.head_ref, 'remediation/unifai-gha')
-      }}
-
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, lineaje-ai-vm]
 
     steps:
-      - name: Checkout scanner scripts
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          path: scanner
-
-      - name: Resolve scan parameters
-        id: resolve
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          IN_SCAN_MODE: ${{ inputs.scan_mode }}
-          IN_TARGET_REPO: ${{ inputs.target_repo }}
-          IN_REF: ${{ inputs.ref }}
-          IN_FILE_PATH: ${{ inputs.file_path }}
-          IN_FOLDER_PATH: ${{ inputs.folder_path }}
-          IN_CREATE_FIX_PR: ${{ inputs.create_fix_pr }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          THIS_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            scan_mode="repo"
-            target_repo="$THIS_REPO"
-            ref="$PR_HEAD_REF"
-            branch="$PR_HEAD_REF"
-            file_path=""
-            folder_path=""
-            create_fix_pr="false"
-          else
-            scan_mode="${IN_SCAN_MODE:-repo}"
-            target_repo="${IN_TARGET_REPO:-$THIS_REPO}"
-
-            if [ -z "$target_repo" ]; then
-              target_repo="$THIS_REPO"
-            fi
-
-            ref="$IN_REF"
-            branch="$IN_REF"
-            file_path="$IN_FILE_PATH"
-            folder_path="$IN_FOLDER_PATH"
-            create_fix_pr="${IN_CREATE_FIX_PR:-false}"
-          fi
-
-          {
-            echo "scan_mode=$scan_mode"
-            echo "target_repo=$target_repo"
-            echo "ref=$ref"
-            echo "branch=$branch"
-            echo "file_path=$file_path"
-            echo "folder_path=$folder_path"
-            echo "create_fix_pr=$create_fix_pr"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Checkout target code
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.resolve.outputs.target_repo }}
-          ref: ${{ steps.resolve.outputs.ref }}
-          path: target
-          token: ${{ secrets.GH_TOKEN || github.token }}
-
-      - name: Prepare scan subject
-        id: subject
-        env:
-          SCAN_MODE: ${{ steps.resolve.outputs.scan_mode }}
-          FILE_PATH: ${{ steps.resolve.outputs.file_path }}
-          FOLDER_PATH: ${{ steps.resolve.outputs.folder_path }}
-        run: |
-          set -euo pipefail
-
-          target_root="$(realpath target)"
-
-          case "$SCAN_MODE" in
-            file)
-              if [ -z "$FILE_PATH" ]; then
-                echo "::error::scan_mode=file requires file_path"
-                exit 1
-              fi
-
-              if ! selected_path="$(realpath "target/$FILE_PATH" 2>/dev/null)" || [ ! -f "$selected_path" ]; then
-                echo "::error::File not found in target repo: $FILE_PATH"
-                exit 1
-              fi
-
-              case "$selected_path" in
-                "$target_root"/*) ;;
-                *)
-                  echo "::error::file_path must resolve inside the target repository"
-                  exit 1
-                  ;;
-              esac
-
-              relative_path="${selected_path#"$target_root"/}"
-              mkdir -p "subject/$(dirname "$relative_path")"
-              cp -- "$selected_path" "subject/$relative_path"
-              echo "source_path=subject" >> "$GITHUB_OUTPUT"
-              ;;
-
-            folder)
-              if [ -z "$FOLDER_PATH" ]; then
-                echo "::error::scan_mode=folder requires folder_path"
-                exit 1
-              fi
-
-              if ! selected_path="$(realpath "target/$FOLDER_PATH" 2>/dev/null)" || [ ! -d "$selected_path" ]; then
-                echo "::error::Folder not found in target repo: $FOLDER_PATH"
-                exit 1
-              fi
-
-              case "$selected_path" in
-                "$target_root"/*) ;;
-                "$target_root")
-                  echo "::error::Use scan_mode=repo to scan the repository root"
-                  exit 1
-                  ;;
-                *)
-                  echo "::error::folder_path must resolve inside the target repository"
-                  exit 1
-                  ;;
-              esac
-
-              relative_path="${selected_path#"$target_root"/}"
-              mkdir -p "subject/$(dirname "$relative_path")"
-              cp -a -- "$selected_path" "subject/$relative_path"
-              echo "source_path=subject" >> "$GITHUB_OUTPUT"
-              ;;
-
-            repo)
-              echo "source_path=target" >> "$GITHUB_OUTPUT"
-              ;;
-
-            *)
-              echo "::error::Unsupported scan_mode: $SCAN_MODE"
-              exit 1
-              ;;
-          esac
-
-          echo "head_sha=$(git -C target rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -199,102 +26,27 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install "mcp==1.27.1" httpx
-          python -c "import importlib.metadata; print('MCP version:', importlib.metadata.version('mcp'))"
+        run: pip install mcp==1.27.1 httpx
 
-      - name: Test PROD MCP connectivity
+      - name: Prepare scanner
         run: |
-          curl -4 -sv \
-            --connect-timeout 10 \
-            --max-time 20 \
-            https://mcp.v2.prod.veedna.com/mcp \
-            -o /dev/null || true
+          cp .github/scm_unifai_scan_hybrid.py /tmp/scm_unifai_scan_hybrid.py
+          rm -rf .github .git
 
       - name: Run Lineaje AI policy scan
         env:
           LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
-
-          # Used by scm_unifai_scan_hybrid.py when --create-fix-pr is enabled.
-          # A custom GH_TOKEN can be used for cross-repository scans;
-          # otherwise github.token is sufficient for this repository.
-          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
-
-          MCP_SERVER_URL: https://mcp.v2.prod.veedna.com/mcp
-
-          SOURCE_PATH: ${{ steps.subject.outputs.source_path }}
-          TARGET_REPO: ${{ steps.resolve.outputs.target_repo }}
-          BRANCH: ${{ steps.resolve.outputs.branch }}
-          HEAD_SHA: ${{ steps.subject.outputs.head_sha }}
-          CREATE_FIX_PR: ${{ steps.resolve.outputs.create_fix_pr }}
+          # Remediation PR token. GITHUB_TOKEN cannot open PRs when the org disables
+          # "Allow GitHub Actions to create and approve pull requests"; set the
+          # LINEAJE_FIX_PR_TOKEN secret (fine-grained PAT or GitHub App token with
+          # Contents + Pull requests: Read and write on this repo) to use it instead.
+          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          MCP_TLS_INSECURE_SKIP_VERIFY: "1"
         run: |
-          set -euo pipefail
-
-          FLAGS=()
-
-          if [ "$CREATE_FIX_PR" = "true" ]; then
-            FLAGS+=(--create-fix-pr)
-          fi
-
-          BRANCH_ARG="$BRANCH"
-
-          if [ -z "$BRANCH_ARG" ]; then
-            BRANCH_ARG="$(git -C target rev-parse --abbrev-ref HEAD)"
-
-            if [ "$BRANCH_ARG" = "HEAD" ]; then
-              BRANCH_ARG="detached"
-            fi
-          fi
-
-          echo "MCP server: $MCP_SERVER_URL"
-          echo "Target repo: $TARGET_REPO"
-          echo "Branch: $BRANCH_ARG"
-          echo "Head SHA: $HEAD_SHA"
-
-          python scanner/.github/scm_unifai_scan_hybrid.py \
-            --source-path "$SOURCE_PATH" \
-            --repo "$TARGET_REPO" \
-            --branch "$BRANCH_ARG" \
-            --head-sha "$HEAD_SHA" \
-            "${FLAGS[@]}" \
-            | tee scan_result.txt
-
-      - name: Comment scan results on the PR
-        if: always() && github.event_name == 'pull_request'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          if [ ! -f scan_result.txt ]; then
-            echo "No scan result was generated."
-            exit 0
-          fi
-
-          head -c 60000 scan_result.txt > comment_body.md
-
-          if [ "$(wc -c < scan_result.txt)" -gt 60000 ]; then
-            printf '\n\n_…report truncated; see the full job summary._\n' >> comment_body.md
-          fi
-
-          gh pr comment "$PR_NUMBER" \
-            --repo "$REPO" \
-            --body-file comment_body.md
-
-      - name: Publish scan result to job summary
-        if: always()
-        run: |
-          if [ -f scan_result.txt ]; then
-            cat scan_result.txt >> "$GITHUB_STEP_SUMMARY"
-          else
-            {
-              echo "## Lineaje AI Scan"
-              echo ""
-              echo "Scanner did not produce a result file."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          python /tmp/scm_unifai_scan_hybrid.py \
+            --source-path . \
+            --repo ${{ github.repository }} \
+            --branch ${{ github.ref_name }} \
+            --head-sha ${{ github.sha }} \
+            --mcp-server-url https://localhost/mcp \
+            ${{ inputs.create_fix_pr && '--create-fix-pr' || '' }} >> "$GITHUB_STEP_SUMMARY"

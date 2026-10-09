@@ -1160,64 +1160,12 @@ _JS_GUARD_SPEC_RE = re.compile(
     r"""(?P<how>\bfrom\s*|\brequire\s*\(\s*)['"]\./unifaiGuard(?P<ext>\.[cm]?js)?['"]""")
 _JS_GUARD_EXPORTS = ("UNIFAI_GUARD_MANIFEST", "VERSION", "findPromptAttacks", "sanitizePrompt",
                      "sanitizeMessages", "unsupportedPiiCategories", "redactPii", "maskPii", "findCodeExecution",
-                     "removeSuspiciousContent", "findShellCommands", "removeHiddenPrompts", "findHiddenPrompts",
-                     "removeEncodedPrompts", "findEncodedPrompts", "removeLeetspeakPrompts", "findLeetspeakPrompts",
-                     "findCommandRequests")
+                     "removeSuspiciousContent", "findShellCommands")
 
 
 def _js_guard_commonjs(source: str) -> str:
-    # Export every name the guard itself exports, so a newer guard from the server is
-    # complete without this script listing its functions (_JS_GUARD_EXPORTS is the fallback).
-    names = re.findall(r"^export (?:const|function) ([A-Za-z_$][\w$]*)", source, flags=re.M) or list(_JS_GUARD_EXPORTS)
     body = re.sub(r"^export (const|function) ", r"\1 ", source, flags=re.M)
-    return body.rstrip("\n") + "\n\nmodule.exports = { " + ", ".join(dict.fromkeys(names)) + " };\n"
-
-
-_SERVER_GUARD_FILES = {
-    "unifai_guard.py": "_UNIFAI_GUARD_SOURCE",
-    "unifaiGuard.js": "_UNIFAI_GUARD_JS_SOURCE",
-    "unifaiGuard.d.ts": "_UNIFAI_GUARD_DTS_SOURCE",
-}
-
-
-def _use_server_guard(payload: Any) -> str:
-    """Commit the shared guard the server sent with the fixes (``shared_guard`` in the scan
-    response) instead of the copy embedded below: the fixes call that guard's functions, so
-    an older embedded copy would leave them undefined. Each file must match its SHA-256, the
-    Python guard must compile and both must carry the UnifAI owner header; otherwise the
-    embedded copy is kept. Returns the version in use."""
-    embedded = _guard_version(_UNIFAI_GUARD_SOURCE)
-    if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
-        logger.info("Shared guard: server sent none; using the embedded copy (%s)", embedded)
-        return embedded
-    import hashlib
-    files, sums = payload["files"], payload.get("sha256") or {}
-    problems = []
-    for name in _SERVER_GUARD_FILES:
-        src = files.get(name)
-        if not isinstance(src, str) or not src:
-            problems.append(f"{name} missing")
-        elif hashlib.sha256(src.encode("utf-8")).hexdigest() != str(sums.get(name, "")):
-            problems.append(f"{name} checksum mismatch")
-    if not problems:
-        if validate_python_source(files["unifai_guard.py"], _GUARD_FILENAME) is not None:
-            problems.append("unifai_guard.py does not compile")
-        if _GUARD_HEADER not in files["unifai_guard.py"] or _JS_GUARD_OWNER not in files["unifaiGuard.js"]:
-            problems.append("not the UnifAI guard")
-    if problems:
-        logger.warning("Shared guard from the server not used (%s); using the embedded copy (%s)",
-                       "; ".join(problems), embedded)
-        return embedded
-    for name, var in _SERVER_GUARD_FILES.items():
-        globals()[var] = files[name]
-    version = _guard_version(files["unifai_guard.py"])
-    logger.info("Shared guard: using the server's copy (%s; embedded copy is %s)", version, embedded)
-    return version
-
-
-def _guard_version(source: str) -> str:
-    m = re.search(r'^__version__ = "([^"]+)"', source or "", flags=re.M)
-    return m.group(1) if m else "unknown"
+    return body.rstrip("\n") + "\n\nmodule.exports = { " + ", ".join(_JS_GUARD_EXPORTS) + " };\n"
 
 
 def _js_guard_files_for(rel: str, content: str) -> Dict[str, str]:
@@ -1303,26 +1251,9 @@ only; Python 3.8+.
   a chat message list (string content and text parts).
 * ``remove_suspicious_content(text)``: uploaded or fetched file content with shell
   commands (alias, rg/ripgrep, curl, wget, rm, echo > file, dd, git, tar, chmod, chown,
-  fsck, mkfs, mkswap, shred, eval, source, export, exec, sed -i, mv; a download piped
-  into a shell as a whole), also when base64-encoded or written in leetspeak, replaced
-  by ``<suspicious_content_removed>``; ``find_shell_commands(text)`` lists them.
-* ``remove_hidden_prompts(text)`` (AI_APP_SEC_001): instructions hidden in HTML
-  comments, invisible elements (hidden, display:none, opacity:0, font-size:0, white
-  text, off-screen, sr-only), zero-width, bidi or Unicode tag characters, replaced by
-  ``<hidden_prompts_removed>``; ``find_hidden_prompts(text)`` lists them.
-* ``remove_encoded_prompts(text)`` (AI_APP_SEC_002): instructions encoded as base64
-  (standard or URL-safe, padded or not, also split over concatenated strings), hex,
-  percent-encoding or ROT13, up to two layers, replaced by
-  ``<encoded_prompts_removed>``; ``find_encoded_prompts(text)`` lists them decoded.
-* ``remove_leetspeak_prompts(text)`` (AI_APP_SEC_032): instructions written in
-  leetspeak (1gn0r3, !gn0r3, |gn0r3) or spaced letters, replaced by
-  ``<leetspeak_prompts_removed>``; ``find_leetspeak_prompts(text)`` lists them.
-* ``find_command_requests(value)`` (AI_APP_SEC_059): the kinds of command-execution
-  request in a prompt (str, chat messages, dict or pydantic model), also hidden,
-  encoded or in leetspeak; the caller refuses the request (HTTP 400) and logs a
-  fingerprint of it, never the text.
-* The remove_* functions accept str, list, dict, pydantic model or dataclass and return
-  the same type.
+  fsck, mkfs, shred, eval, source, export), also when base64-encoded or written in
+  leetspeak, replaced by ``<suspicious_content_removed>``; ``find_shell_commands(text)``
+  lists them.
 * ``find_code_execution(text)``: the dynamic code-execution primitives found in
   model output (eval, exec, os.system, subprocess with shell=True, JS eval /
   Function / child_process, shell eval, piping a download into a shell), for code
@@ -1337,10 +1268,8 @@ import re
 
 __all__ = ["sanitize_prompt", "find_prompt_attacks", "redact_pii", "mask_pii", "sanitize_messages",
            "unsupported_pii_categories", "find_code_execution", "remove_suspicious_content",
-           "find_shell_commands", "remove_hidden_prompts", "find_hidden_prompts",
-           "remove_encoded_prompts", "find_encoded_prompts", "remove_leetspeak_prompts",
-           "find_leetspeak_prompts", "find_command_requests"]
-__version__ = "2.5.0"
+           "find_shell_commands"]
+__version__ = "2.4.0"
 
 # UNIFAI-GUARD owner="Lineaje UnifAI": generated by UnifAI remediation scans; do not edit.
 # Scans read UNIFAI_GUARD_MANIFEST (without running this file) to reuse this module instead
@@ -1348,18 +1277,13 @@ __version__ = "2.5.0"
 # policy needs one listed nowhere below. Keys are the policies' runtime.routine.id values.
 UNIFAI_GUARD_MANIFEST = {
     "owner": "Lineaje UnifAI",
-    "version": "2.5.0",
+    "version": "2.4.0",
     "routines": {
         "sanitize_prompt_injection": ["sanitize_prompt", "find_prompt_attacks", "sanitize_messages",
                                       "remove_suspicious_content", "find_shell_commands"],
         "mask_pii": ["redact_pii", "mask_pii"],
         "mask_pii_and_secrets": ["redact_pii", "mask_pii"],
         "validate_llm_output": ["find_code_execution"],
-        "remove_hidden_prompts": ["remove_hidden_prompts", "find_hidden_prompts"],
-        "remove_encoded_prompts": ["remove_encoded_prompts", "find_encoded_prompts"],
-        "remove_leetspeak_prompts": ["remove_leetspeak_prompts", "find_leetspeak_prompts"],
-        "remove_suspicious_content": ["remove_suspicious_content", "find_shell_commands"],
-        "reject_command_requests": ["find_command_requests"],
     },
 }
 
@@ -1722,11 +1646,6 @@ _CODE_EXECUTION = (
     ("shell_eval", re.compile(r"(?:^|[;&|\s])(?:eval|source)\s+['\"$]|\b(?:bash|sh|zsh)\s+-c\s+\S", re.M)),
     ("pipe_to_shell", re.compile(r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b")),
     ("destructive_command", re.compile(r"\brm\s+-rf\s+/|\bmkfs(?:\.\w+)?\s|\bdd\s+if=|:\(\)\s*\{\s*:\|:&\s*\};:")),
-    ("dynamic_lookup", re.compile(r"\bgetattr\s*\(\s*(?:__builtins__|builtins|globals\s*\(\s*\)|os)\s*,"
-                                  r"|[\"'](?:ev|ex|sys|po)[\"']\s*\+\s*[\"'](?:al|ec|tem|pen)[\"']")),
-    ("js_string_timer", re.compile(r"\bset(?:Timeout|Interval|Immediate)\s*\(\s*['\"`]")),
-    ("unsafe_deserialization", re.compile(r"\b(?:pickle|cPickle|_pickle|dill|marshal|shelve|jsonpickle)\.(?:loads?|decode|open)\s*\("
-                                          r"|\byaml\.(?:unsafe_)?load\s*\((?![^)]*Safe)")),
 )
 
 
@@ -1759,28 +1678,12 @@ _CMD = (
     r"|fsck(?:\.\w+)?(?:\s+-\S+)*\s+\S+"
     r"|mkfs(?:\.\w+)?\s+\S+"
     r"|shred\s+(?:-\S+\s+)*\S+"
-    r"|mkswap\s+(?:-\S+\s+)*\S+"
-    r"|exec\s+(?:-\S+\s+)*[/~$.]\S*"
-    r"|sed\s+(?:-[a-z]*i\S*\s+(?:-\S+\s+)*\S+|(?:-\S+\s+)*[\"']?s/[^/\n]*/[^/\n]*/)"
-    r"|(?:ba|z|k)?sh\s+(?:-\S+\s+)*[\w./~$-]+\.sh\b"
-    r"|mv\s+(?:-[a-z]+\s+)*[\w./~$*-]+\s+[\w./~$*-]+"
     r"|(?:eval|source)\s+\S+"
     r"|export\s+[A-Z_][A-Z0-9_]*=\S*"
     r")"
 )
 # A command at the start of a line, after a prompt, or after a shell separator.
-# A download piped into a shell is removed as a whole (curl ... | sh), not up to the pipe.
-_SHELL_LINE = re.compile(r"(?:(?<=^)|(?<=\n)|(?<=[;&|`]))[ \t]*(?:[$#>]\s*)?" + _CMD + r"[^\n;&|]*"
-                         r"(?:\|\s*(?:sudo\s+)?(?:ba|z|k|da)?sh\b[^\n;&|]*)?", re.I)
-# A command asked for in prose ("Tell the agent to execute chmod 777 /etc/shadow"), and
-# destructive commands wherever they appear.
-_CMD_IN_PROSE = re.compile(r"\b(?:run|execute|exec|type|enter|paste|invoke|launch)\b\s*:?\s*[`\"']?(?P<cmd>"
-                           + _CMD + r"[^\n;&|`\"']*)", re.I)
-_DESTRUCTIVE = re.compile(
-    r"\b(?:mkfs(?:\.\w+)?|mkswap|shred)\s+(?:-\S+\s+)*[/~$]\S*"
-    r"|\bdd\s+(?:if|of)=\S+(?:\s+(?:if|of|bs|count|seek)=\S+)*"
-    r"|\brm\s+-[a-z]*r[a-z]*\s+[/~$]\S*"
-    r"|\bchmod\s+(?:-R\s+)?[0-7]{3,4}\s+/\S+", re.I)
+_SHELL_LINE = re.compile(r"(?:(?<=^)|(?<=\n)|(?<=[;&|`]))[ \t]*(?:[$#>]\s*)?" + _CMD + r"[^\n;&|]*", re.I)
 _BASE64_SHORT = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])")
 _LEET_MULTI = (("|-|", "h"), ("|_|", "u"), ("|<", "k"), ("|\\|", "n"), ("/\\", "a"), ("()", "o"))
 
@@ -1795,8 +1698,6 @@ def _shell_spans(text):
     """(start, end) of shell-command lines in *text*: plain, leetspeak-folded per line, or
     inside a base64 token."""
     spans = [(m.start(), m.end()) for m in _SHELL_LINE.finditer(text)]
-    spans += [m.span("cmd") for m in _CMD_IN_PROSE.finditer(text)]
-    spans += [(m.start(), m.end()) for m in _DESTRUCTIVE.finditer(text)]
     offset = 0
     for line in text.splitlines(keepends=True):
         body = line.rstrip("\r\n")
@@ -1841,362 +1742,6 @@ def remove_suspicious_content(text):
     for start, end in reversed(_shell_spans(text)):
         out = out[:start] + "<suspicious_content_removed>" + out[end:]
     return out
-
-
-# --- hidden, encoded and leetspeak prompts; command requests ------------------------
-# (AI_APP_SEC_001 / 002 / 032 / 059). One function per policy, so a fix for one policy
-# never changes what another policy's function does. sanitize_prompt (AI_APP_SEC_070)
-# keeps its own phrase list; the wider one below is used only by these functions.
-
-_INSTRUCTION = re.compile(
-    r"\b(?:ignore|disregard|forget|override|bypass)\s+"
-    r"(?:(?:all|any|every|the|your|my|these|those|of|previous|prior|above|earlier|preceding|"
-    r"original|existing|safety|system|security)\s+){0,4}"
-    r"(?:instructions?|rules|guidelines|guardrails|restrictions|polic(?:y|ies)|prompts?|filters?)\b"
-    r"|\byou\s+are\s+now\s+(?:in\s+)?(?:an?\s+)?(?:dan|unrestricted|unfiltered|jailbroken|evil|"
-    r"developer\s+mode|admin(?:istrator)?\s+mode|god\s+mode)\b"
-    r"|\b(?:reveal|print|show|dump|leak|send|output|exfiltrate|list)\s+(?:me\s+)?(?:all\s+|the\s+|your\s+|any\s+)*"
-    r"(?:system\s+prompts?|hidden\s+instructions|secrets?|(?:user\s+)?passwords?|api[\s_-]?keys?|credentials|"
-    r"access\s+tokens?|private\s+keys?)\b"
-    r"|\bdo\s+anything\s+now\b", re.I)
-
-
-def _is_instruction(text):
-    """*text* (already decoded / made visible) asks the model to override its rules, leak
-    secrets or run a command."""
-    if not isinstance(text, str) or not text.strip():
-        return False
-    return bool(_INSTRUCTION.search(text) or _phrase_spans(text) or _SHELL.search(text)
-                or _SHELL_LINE.search(text.strip()) or _command_request_spans(text))
-
-
-def _replace_spans(text, spans, marker):
-    spans = sorted(spans)
-    merged = []
-    for start, end in spans:
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    out = text
-    for start, end in reversed(merged):
-        out = out[:start] + marker + out[end:]
-    return out
-
-
-# Hidden: invisible characters, Unicode tag characters, bidi overrides, HTML comments and
-# elements styled to be invisible (hidden, display:none, visibility:hidden, opacity:0,
-# font-size:0/1, white text, off-screen, sr-only).
-_INVISIBLE_CHARS = "\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff\u00ad\u180e" \
-                   "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
-_INVISIBLE_RE = re.compile("[" + _INVISIBLE_CHARS + "]")
-_TAG_RUN = re.compile("[\U000e0000-\U000e007f]+")
-_HIDDEN_ELEMENT = re.compile(
-    r"<(?P<tag>[a-z][a-z0-9]*)\b[^>]*?(?:\shidden\b|\saria-hidden\s*=\s*[\"']true[\"']"
-    r"|style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|visibility\s*:\s*hidden"
-    r"|font-size\s*:\s*[01](?:\.\d+)?(?:px|pt|em|rem)?(?=\s*[;\"'])"
-    r"|opacity\s*:\s*0(?:\.0+)?(?=\s*[;\"'])"
-    r"|(?<![\w-])color\s*:\s*(?:#fff(?:fff)?\b|white\b|rgba?\(\s*255\s*,\s*255\s*,\s*255)"
-    r"|(?:left|top|text-indent)\s*:\s*-\d{3,})[^\"']*[\"']"
-    r"|class\s*=\s*[\"'][^\"']*\b(?:hidden|invisible|sr-only|visually-hidden|d-none)\b[^\"']*[\"'])[^>]*>"
-    r"(?P<body>.*?)</(?P=tag)\s*>", re.I | re.S)
-_TAGS = re.compile(r"<[^>]+>")
-
-
-def _visible(text):
-    """(text without invisible characters, index map back into *text*)."""
-    chars, index = [], []
-    for i, ch in enumerate(text):
-        if ch not in _INVISIBLE_CHARS and not 0xE0000 <= ord(ch) <= 0xE007F:
-            chars.append(ch)
-            index.append(i)
-    return "".join(chars), index
-
-
-def _hidden_spans(text):
-    spans = []
-    start = text.find("<!--")
-    while start != -1:
-        end = text.find("-->", start + 4)
-        if end == -1:
-            break
-        body = text[start + 4:end]
-        if _is_instruction(_visible(body)[0]):
-            spans.append((start, end + 3, body.strip()))
-        start = text.find("<!--", end + 3)
-    for m in _HIDDEN_ELEMENT.finditer(text):
-        body = _visible(_TAGS.sub(" ", m.group("body")))[0]
-        if _is_instruction(body):
-            spans.append((m.start(), m.end(), body.strip()))
-    for m in _TAG_RUN.finditer(text):
-        decoded = "".join(chr(ord(ch) - 0xE0000) for ch in m.group(0) if 0xE0020 <= ord(ch) <= 0xE007E)
-        if _is_instruction(decoded):
-            spans.append((m.start(), m.end(), decoded))
-    if _INVISIBLE_RE.search(text):
-        visible, index = _visible(text)
-        for start, end in _instruction_spans(visible):
-            o_start, o_end = index[start], index[end - 1] + 1
-            if _INVISIBLE_RE.search(text, o_start, o_end):
-                spans.append((o_start, o_end, visible[start:end]))
-    return spans
-
-
-def _instruction_spans(text):
-    spans = [(m.start(), m.end()) for m in _INSTRUCTION.finditer(text)]
-    spans += [(s, e) for s, e, _c in _phrase_spans(text)]
-    spans += [(m.start(), m.end()) for m in _SHELL.finditer(text)]
-    return spans
-
-
-def find_hidden_prompts(text):
-    """The instructions hidden in *text* (HTML comments, invisible elements, zero-width or
-    Unicode tag characters), made readable; empty list: none."""
-    if not isinstance(text, str) or not text:
-        return []
-    return [found for _s, _e, found in sorted(_hidden_spans(text))]
-
-
-def remove_hidden_prompts(text):
-    """*text* with each hidden instruction replaced by ``<hidden_prompts_removed>``; visible
-    text, and hidden content that is not an instruction, are kept. Accepts str, list,
-    dict, pydantic model or dataclass and returns the same type."""
-    if not isinstance(text, str):
-        return _structured(text, remove_hidden_prompts) if text is not None else text
-    spans = _hidden_spans(text)
-    if not spans:
-        return text
-    return _replace_spans(text, [(s, e) for s, e, _f in spans], "<hidden_prompts_removed>")
-
-
-# Encoded: base64 (standard or URL-safe, padded or not), hex, percent-encoding and ROT13,
-# up to two layers; a span is removed only when its decoded text is an instruction.
-_B64_TOKEN = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/=_-])")
-_HEX_TOKEN = re.compile(r"(?<![0-9A-Fa-f])(?:\\x)?(?:[0-9A-Fa-f]{2}(?:\\x)?){8,}(?![0-9A-Fa-f])")
-_PCT_TOKEN = re.compile(r"(?<![^\s\"'<>])[^\s\"'<>%]*%[0-9A-Fa-f]{2}[^\s\"'<>]*")
-_JOINED_STRINGS = re.compile(r"[\"']\s*\+\s*[\"']")
-_ROT13 = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
-                       "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm")
-
-
-def _printable(decoded):
-    return decoded and sum(ch.isprintable() or ch.isspace() for ch in decoded) >= 0.95 * len(decoded)
-
-
-def _decode_token(token):
-    """Readable text *token* decodes to (base64 / hex / percent), else None."""
-    import urllib.parse
-    raw = token.replace("\\x", "")
-    if "%" in token:
-        if len(re.findall(r"%[0-9A-Fa-f]{2}", token)) < 4:
-            return None
-        decoded = urllib.parse.unquote(token)
-        return decoded if decoded != token and _printable(decoded) else None
-    if re.fullmatch(r"(?:[0-9A-Fa-f]{2}){8,}", raw):
-        try:
-            decoded = bytes.fromhex(raw).decode("utf-8")
-            if _printable(decoded):
-                return decoded
-        except (ValueError, UnicodeDecodeError):
-            pass
-    body = token.rstrip("=").replace("-", "+").replace("_", "/")
-    if len(body) % 4 == 1:
-        return None
-    try:
-        decoded = base64.b64decode(body + "=" * (-len(body) % 4), validate=True).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError, ValueError):
-        return None
-    return decoded if _printable(decoded) else None
-
-
-def _decoded_instruction(decoded, depth=1):
-    if _is_instruction(decoded):
-        return decoded
-    if depth < 2:
-        for rx in (_B64_TOKEN, _HEX_TOKEN, _PCT_TOKEN):
-            for m in rx.finditer(decoded):
-                inner = _decode_token(m.group(0))
-                if inner and _decoded_instruction(inner, depth + 1):
-                    return inner
-    return None
-
-
-def _encoded_spans_wide(text):
-    spans, pieces = [], []
-    for rx in (_B64_TOKEN, _HEX_TOKEN, _PCT_TOKEN):
-        for m in rx.finditer(text):
-            decoded = _decode_token(m.group(0))
-            if decoded is None:
-                continue
-            pieces.append((m.start(), m.end(), decoded))
-            found = _decoded_instruction(decoded)
-            if found:
-                spans.append((m.start(), m.end(), found))
-    # A payload split over concatenated string literals ("SWdu..." + "aW5z...").
-    pieces.sort()
-    for i in range(len(pieces) - 1):
-        a, b = pieces[i], pieces[i + 1]
-        if _JOINED_STRINGS.fullmatch(text[a[1]:b[0]].strip()) or not text[a[1]:b[0]].strip():
-            joined = a[2] + b[2]
-            if _is_instruction(joined) and not (_is_instruction(a[2]) and _is_instruction(b[2])):
-                spans.append((a[0], b[1], joined))
-    for line_start, line in _lines_with_offsets(text):
-        rotated = line.translate(_ROT13)
-        for start, end in _instruction_spans(rotated):
-            if not _instruction_spans(line[start:end]):
-                spans.append((line_start + start, line_start + end, rotated[start:end]))
-    return spans
-
-
-def _lines_with_offsets(text):
-    offset = 0
-    for line in text.splitlines(keepends=True):
-        yield offset, line.rstrip("\r\n")
-        offset += len(line)
-
-
-def find_encoded_prompts(text):
-    """The decoded instructions found in *text* (empty list: none)."""
-    if not isinstance(text, str) or not text:
-        return []
-    return [found for _s, _e, found in sorted(_encoded_spans_wide(text))]
-
-
-def remove_encoded_prompts(text):
-    """*text* with each encoded instruction (base64, URL-safe base64, hex, percent, ROT13)
-    replaced by ``<encoded_prompts_removed>``; encoded data that is not an instruction is
-    kept. Accepts str, list, dict, pydantic model or dataclass and returns the same type."""
-    if not isinstance(text, str):
-        return _structured(text, remove_encoded_prompts) if text is not None else text
-    spans = _encoded_spans_wide(text)
-    if not spans:
-        return text
-    return _replace_spans(text, [(s, e) for s, e, _f in spans], "<encoded_prompts_removed>")
-
-
-# Leetspeak: each letter also matches its usual substitutes (1 ! | for i and l, 3 for e,
-# 0 for o, 4 @ for a, 5 $ for s, 7 + for t ...); letters may be spaced out, with a wider
-# gap between words. A match of this wider list counts only if it uses a substitute or
-# spaced letters; the plain phrases sanitize_prompt removes are removed too.
-_LEET_LETTERS = {"a": "a4@", "b": "b8", "e": "e3", "g": "g96", "i": "i1!|l", "l": "l1|i",
-                 "o": "o0", "s": "s5$", "t": "t7+", "z": "z2"}
-
-
-def _leet_word(word):
-    return r" ?".join("[" + re.escape(_LEET_LETTERS.get(ch, ch)) + "]" for ch in word)
-
-
-def _leet_any(words):
-    return "(?:" + "|".join(_leet_word(w) for w in sorted(words, key=len, reverse=True)) + ")"
-
-
-_GAP = r"\s+"
-_LEET_PROMPT = re.compile(
-    _leet_any(("ignore", "disregard", "forget", "override", "bypass")) + _GAP
-    + "(?:" + _leet_any(("all", "any", "the", "your", "my", "previous", "prior", "above", "earlier",
-                         "safety", "system", "original")) + _GAP + "){0,3}"
-    + _leet_any(("instructions", "instruction", "rules", "guidelines", "restrictions", "prompt",
-                 "prompts", "filters", "policies", "policy"))
-    + "|" + _leet_any(("you",)) + _GAP + _leet_any(("are",)) + _GAP + _leet_any(("now",)) + _GAP
-    + "(?:" + _leet_any(("in", "an", "a")) + _GAP + ")?"
-    + _leet_any(("dan", "unrestricted", "unfiltered", "jailbroken", "evil", "developer", "admin", "god"))
-    + "|" + _leet_any(("reveal", "print", "show", "dump", "leak", "send")) + _GAP
-    + "(?:" + _leet_any(("the", "your", "all", "me")) + _GAP + "){0,2}"
-    + _leet_any(("system", "secrets", "secret", "passwords", "password", "credentials", "api"))
-    + "(?:" + _GAP + _leet_any(("prompt", "keys", "key")) + ")?",
-    re.I)
-_LEET_MARK = re.compile(r"[0-9@$!|+]|(?<![^\W\d_])[^\W\d_] [^\W\d_] [^\W\d_](?![^\W\d_])")
-
-
-def _leetspeak_spans(text):
-    spans = [(start, end, text[start:end]) for start, end, _c in _phrase_spans(text)]
-    for line_start, line in _lines_with_offsets(text):
-        for m in _LEET_PROMPT.finditer(line):
-            if _LEET_MARK.search(m.group(0)):
-                # The rest of the line belongs to the same instruction ("... 4nd r3v34l ...").
-                spans.append((line_start + m.start(), line_start + len(line.rstrip()), m.group(0)))
-        folded = _fold_leet(line)
-        if folded != line and _SHELL_LINE.search(folded) and not _SHELL_LINE.search(line):
-            lead = len(line) - len(line.lstrip())
-            spans.append((line_start + lead, line_start + len(line.rstrip()), folded.strip()))
-    return spans
-
-
-def find_leetspeak_prompts(text):
-    """The leetspeak or letter-spaced instructions found in *text* (empty list: none)."""
-    if not isinstance(text, str) or not text:
-        return []
-    return [text[s:e] for s, e, _f in sorted(_leetspeak_spans(text))]
-
-
-def remove_leetspeak_prompts(text):
-    """*text* with each leetspeak or letter-spaced instruction replaced by
-    ``<leetspeak_prompts_removed>`` (also the plain phrases sanitize_prompt removes);
-    ordinary text with digits is kept. Accepts str, list,
-    dict, pydantic model or dataclass and returns the same type."""
-    if not isinstance(text, str):
-        return _structured(text, remove_leetspeak_prompts) if text is not None else text
-    spans = _leetspeak_spans(text)
-    if not spans:
-        return text
-    return _replace_spans(text, [(s, e) for s, e, _f in spans], "<leetspeak_prompts_removed>")
-
-
-# Command requests (AI_APP_SEC_059): a request to run a shell command or code with a
-# target. A word or file name on its own (exec, bash, setup.sh) or a question about one
-# is not a request.
-_RUN_VERB = r"\b(?:run|execute|exec|eval|evaluate|launch)\b\s*:?\s*[`\"']?"
-_COMMAND_REQUEST = (
-    ("shell_command", re.compile(_RUN_VERB + _CMD, re.I)),
-    ("shell_command", re.compile(_RUN_VERB + r"(?:sudo\s+)?(?:bash|sh|zsh|ksh|python3?|node|perl|ruby|php|"
-                                 r"powershell|pwsh|cmd)\s+(?:-\w+\s+)?\S", re.I)),
-    ("code_execution", re.compile(_RUN_VERB + r"[\w.]+\([^)\n]*\)")),
-    ("secret_access", re.compile(
-        r"\b(?:cat|type|print|echo|read|dump|show|send)\b[^\n]{0,40}"
-        r"(?:/etc/(?:passwd|shadow)|os\.environ|process\.env|\.ssh/|\.aws/credentials|\$[A-Z_]*(?:KEY|TOKEN|SECRET))",
-        re.I)),
-)
-
-
-def _command_request_spans(text):
-    spans = []
-    for category, pattern in _COMMAND_REQUEST:
-        spans.extend((m.start(), m.end(), category) for m in pattern.finditer(text))
-    return spans
-
-
-def _command_findings(text):
-    found = {category for _s, _e, category in _command_request_spans(text)}
-    if _SHELL.search(text):
-        found.add("shell_command")
-    for name in find_code_execution(text):
-        found.add("pipe_to_shell" if name == "pipe_to_shell" else "code_execution")
-    return found
-
-
-def _strings(value, out, depth=0):
-    if isinstance(value, str):
-        out.append(value)
-    elif depth <= 8 and value is not None:
-        _structured(value, lambda s: out.append(s) or s, depth)
-    return out
-
-
-def find_command_requests(text):
-    """The kinds of command-execution request in *text* (empty list: none): shell
-    commands, code execution, piping a download into a shell, reading secrets; also when
-    the request is hidden, encoded or written in leetspeak. Accepts str, a list of chat
-    messages, dict or pydantic model. The caller refuses the request (HTTP 400) and logs
-    a fingerprint of it, never the text."""
-    found = set()
-    for piece in _strings(text, []):
-        if not piece:
-            continue
-        variants = [piece, _visible(piece)[0], _fold_leet(piece)]
-        variants += [f for _s, _e, f in _hidden_spans(piece)]
-        variants += [f for _s, _e, f in _encoded_spans_wide(piece)]
-        for variant in variants:
-            found |= _command_findings(variant)
-    return sorted(found)
 '''
 _UNIFAI_GUARD_JS_SOURCE = r'''/*
  * Prompt-injection and PII guard added by Lineaje UnifAI remediation.
@@ -2222,22 +1767,7 @@ _UNIFAI_GUARD_JS_SOURCE = r'''/*
  *   message list (string content and text parts).
  * - findCodeExecution(text): the dynamic code-execution primitives found in model
  *   output (eval, exec, os.system, subprocess with shell=True, JS eval / Function /
- *   child_process, shell eval, piping a download into a shell, string timers, unsafe
- *   deserialization).
- * - removeSuspiciousContent(text): uploaded or fetched file content with shell commands
- *   replaced by <suspicious_content_removed>; findShellCommands(text) lists them.
- * - removeHiddenPrompts(text) (AI_APP_SEC_001): instructions hidden in HTML comments,
- *   invisible elements, zero-width, bidi or Unicode tag characters, replaced by
- *   <hidden_prompts_removed>; findHiddenPrompts(text) lists them.
- * - removeEncodedPrompts(text) (AI_APP_SEC_002): instructions encoded as base64
- *   (standard or URL-safe, padded or not, also split over concatenated strings), hex,
- *   percent-encoding or ROT13, replaced by <encoded_prompts_removed>;
- *   findEncodedPrompts(text) lists them decoded.
- * - removeLeetspeakPrompts(text) (AI_APP_SEC_032): instructions in leetspeak or spaced
- *   letters, replaced by <leetspeak_prompts_removed>; findLeetspeakPrompts(text).
- * - findCommandRequests(value) (AI_APP_SEC_059): the kinds of command-execution request
- *   in a prompt (string, chat messages or object); the caller refuses it (HTTP 400).
- * The remove* functions accept strings, arrays and objects and return the same shape.
+ *   child_process, shell eval, piping a download into a shell).
  *
  * Never apply these to identifiers or lookup keys (user ids, file names,
  * document ids): those must reach their service unchanged.
@@ -2249,22 +1779,17 @@ _UNIFAI_GUARD_JS_SOURCE = r'''/*
 // policy needs one listed nowhere below. Keys are the policies' runtime.routine.id values.
 export const UNIFAI_GUARD_MANIFEST = {
   "owner": "Lineaje UnifAI",
-  "version": "2.5.0",
+  "version": "2.4.0",
   "routines": {
     "sanitize_prompt_injection": ["sanitizePrompt", "findPromptAttacks", "sanitizeMessages",
                                   "removeSuspiciousContent", "findShellCommands"],
     "mask_pii": ["redactPii", "maskPii"],
     "mask_pii_and_secrets": ["redactPii", "maskPii"],
-    "validate_llm_output": ["findCodeExecution"],
-    "remove_hidden_prompts": ["removeHiddenPrompts", "findHiddenPrompts"],
-    "remove_encoded_prompts": ["removeEncodedPrompts", "findEncodedPrompts"],
-    "remove_leetspeak_prompts": ["removeLeetspeakPrompts", "findLeetspeakPrompts"],
-    "remove_suspicious_content": ["removeSuspiciousContent", "findShellCommands"],
-    "reject_command_requests": ["findCommandRequests"]
+    "validate_llm_output": ["findCodeExecution"]
   }
 };
 
-export const VERSION = "2.5.0";
+export const VERSION = "2.4.0";
 
 // --- prompt injection -------------------------------------------------------
 
@@ -2683,10 +2208,7 @@ const CODE_EXECUTION = [
   ["js_child_process", /\b(?:child_process\.)?(?:exec|execSync|spawn|spawnSync)\s*\(\s*['"`]/],
   ["shell_eval", /(?:^|[;&|\s])(?:eval|source)\s+['"$]|\b(?:bash|sh|zsh)\s+-c\s+\S/m],
   ["pipe_to_shell", /\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b/],
-  ["destructive_command", /\brm\s+-rf\s+\/|\bmkfs(?:\.\w+)?\s|\bdd\s+if=|:\(\)\s*\{\s*:\|:&\s*\};:/],
-  ["dynamic_lookup", /\bgetattr\s*\(\s*(?:__builtins__|builtins|globals\s*\(\s*\)|os)\s*,|["'](?:ev|ex|sys|po)["']\s*\+\s*["'](?:al|ec|tem|pen)["']/],
-  ["js_string_timer", /\bset(?:Timeout|Interval|Immediate)\s*\(\s*['"`]/],
-  ["unsafe_deserialization", /\b(?:pickle|cPickle|_pickle|dill|marshal|shelve|jsonpickle)\.(?:loads?|decode|open)\s*\(|\byaml\.(?:unsafe_)?load\s*\((?![^)]*Safe)/]
+  ["destructive_command", /\brm\s+-rf\s+\/|\bmkfs(?:\.\w+)?\s|\bdd\s+if=|:\(\)\s*\{\s*:\|:&\s*\};:/]
 ];
 
 /**
@@ -2716,26 +2238,10 @@ const CMD = "(?:sudo\\s+)?(?:"
   + "|fsck(?:\\.\\w+)?(?:\\s+-\\S+)*\\s+\\S+"
   + "|mkfs(?:\\.\\w+)?\\s+\\S+"
   + "|shred\\s+(?:-\\S+\\s+)*\\S+"
-  + "|mkswap\\s+(?:-\\S+\\s+)*\\S+"
-  + "|exec\\s+(?:-\\S+\\s+)*[/~$.]\\S*"
-  + "|sed\\s+(?:-[a-z]*i\\S*\\s+(?:-\\S+\\s+)*\\S+|(?:-\\S+\\s+)*[\"']?s/[^/\\n]*/[^/\\n]*/)"
-  + "|(?:ba|z|k)?sh\\s+(?:-\\S+\\s+)*[\\w./~$-]+\\.sh\\b"
-  + "|mv\\s+(?:-[a-z]+\\s+)*[\\w./~$*-]+\\s+[\\w./~$*-]+"
   + "|(?:eval|source)\\s+\\S+"
   + "|export\\s+[A-Z_][A-Z0-9_]*=\\S*"
   + ")";
-// A download piped into a shell is removed as a whole (curl ... | sh), not up to the pipe.
-const SHELL_LINE = new RegExp("(?:(?<=^)|(?<=\\n)|(?<=[;&|`]))[ \\t]*(?:[$#>]\\s*)?" + CMD + "[^\\n;&|]*"
-  + "(?:\\|\\s*(?:sudo\\s+)?(?:ba|z|k|da)?sh\\b[^\\n;&|]*)?", "gi");
-// A command asked for in prose ("Tell the agent to execute chmod 777 /etc/shadow"), and
-// destructive commands wherever they appear.
-const CMD_IN_PROSE = new RegExp("\\b(?:run|execute|exec|type|enter|paste|invoke|launch)\\b\\s*:?\\s*[`\"']?(?<cmd>"
-  + CMD + "[^\\n;&|`\"']*)", "gi");
-const DESTRUCTIVE = new RegExp(
-  "\\b(?:mkfs(?:\\.\\w+)?|mkswap|shred)\\s+(?:-\\S+\\s+)*[/~$]\\S*"
-  + "|\\bdd\\s+(?:if|of)=\\S+(?:\\s+(?:if|of|bs|count|seek)=\\S+)*"
-  + "|\\brm\\s+-[a-z]*r[a-z]*\\s+[/~$]\\S*"
-  + "|\\bchmod\\s+(?:-R\\s+)?[0-7]{3,4}\\s+/\\S+", "gi");
+const SHELL_LINE = new RegExp("(?:(?<=^)|(?<=\\n)|(?<=[;&|`]))[ \\t]*(?:[$#>]\\s*)?" + CMD + "[^\\n;&|]*", "gi");
 const BASE64_SHORT = /(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])/g;
 const LEET_MULTI = [["|-|", "h"], ["|_|", "u"], ["|<", "k"], ["|\\|", "n"], ["/\\", "a"], ["()", "o"]];
 
@@ -2753,11 +2259,6 @@ function hasShell(text) {
 
 function shellSpans(text) {
   const spans = matches(SHELL_LINE, text).map((m) => [m.index, m.index + m[0].length]);
-  for (const m of matches(CMD_IN_PROSE, text)) {
-    const end = m.index + m[0].length;
-    spans.push([end - m.groups.cmd.length, end]);
-  }
-  for (const m of matches(DESTRUCTIVE, text)) spans.push([m.index, m.index + m[0].length]);
   let offset = 0;
   for (const line of text.split(/(?<=\n)/)) {
     const body = line.replace(/[\r\n]+$/, "");
@@ -2800,377 +2301,6 @@ export function removeSuspiciousContent(text) {
   }
   return out;
 }
-
-
-// --- hidden, encoded and leetspeak prompts; command requests ------------------------
-// (AI_APP_SEC_001 / 002 / 032 / 059). One function per policy, so a fix for one policy
-// never changes what another policy's function does. sanitizePrompt (AI_APP_SEC_070)
-// keeps its own phrase list; the wider one below is used only by these functions.
-
-const INSTRUCTION = new RegExp(
-  "\\b(?:ignore|disregard|forget|override|bypass)\\s+"
-  + "(?:(?:all|any|every|the|your|my|these|those|of|previous|prior|above|earlier|preceding|"
-  + "original|existing|safety|system|security)\\s+){0,4}"
-  + "(?:instructions?|rules|guidelines|guardrails|restrictions|polic(?:y|ies)|prompts?|filters?)\\b"
-  + "|\\byou\\s+are\\s+now\\s+(?:in\\s+)?(?:an?\\s+)?(?:dan|unrestricted|unfiltered|jailbroken|evil|"
-  + "developer\\s+mode|admin(?:istrator)?\\s+mode|god\\s+mode)\\b"
-  + "|\\b(?:reveal|print|show|dump|leak|send|output|exfiltrate|list)\\s+(?:me\\s+)?(?:all\\s+|the\\s+|your\\s+|any\\s+)*"
-  + "(?:system\\s+prompts?|hidden\\s+instructions|secrets?|(?:user\\s+)?passwords?|api[\\s_-]?keys?|credentials|"
-  + "access\\s+tokens?|private\\s+keys?)\\b"
-  + "|\\bdo\\s+anything\\s+now\\b", "gi");
-
-function spansOf(pattern, text) {
-  return matches(pattern, text).map((m) => [m.index, m.index + m[0].length]);
-}
-
-// text (already decoded / made visible) asks the model to override its rules, leak
-// secrets or run a command.
-function isInstruction(text) {
-  if (typeof text !== "string" || !text.trim()) return false;
-  return spansOf(INSTRUCTION, text).length > 0 || phraseSpans(text).length > 0
-    || matches(SHELL, text).length > 0 || hasShell(text.trim()) || commandRequestSpans(text).length > 0;
-}
-
-function replaceSpans(text, spans, marker) {
-  spans = spans.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-  const merged = [];
-  for (const [start, end] of spans) {
-    const prev = merged[merged.length - 1];
-    if (prev && start <= prev[1]) prev[1] = Math.max(prev[1], end);
-    else merged.push([start, end]);
-  }
-  let out = text;
-  for (let i = merged.length - 1; i >= 0; i--) {
-    out = out.slice(0, merged[i][0]) + marker + out.slice(merged[i][1]);
-  }
-  return out;
-}
-
-function linesWithOffsets(text) {
-  const out = [];
-  let offset = 0;
-  for (const line of text.split(/(?<=\n)/)) {
-    out.push([offset, line.replace(/[\r\n]+$/, "")]);
-    offset += line.length;
-  }
-  return out;
-}
-
-// Hidden: invisible characters, Unicode tag characters, bidi overrides, HTML comments and
-// elements styled to be invisible (hidden, display:none, visibility:hidden, opacity:0,
-// font-size:0/1, white text, off-screen, sr-only).
-const INVISIBLE_CHARS = "\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff\u00ad\u180e"
-  + "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069";
-const INVISIBLE_RE = new RegExp("[" + INVISIBLE_CHARS + "]");
-const TAG_RUN = /(?:\uDB40[\uDC00-\uDC7F])+/g;
-const HIDDEN_ELEMENT = new RegExp(
-  "<(?<tag>[a-z][a-z0-9]*)\\b[^>]*?(?:\\shidden\\b|\\saria-hidden\\s*=\\s*[\"']true[\"']"
-  + "|style\\s*=\\s*[\"'][^\"']*(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden"
-  + "|font-size\\s*:\\s*[01](?:\\.\\d+)?(?:px|pt|em|rem)?(?=\\s*[;\"'])"
-  + "|opacity\\s*:\\s*0(?:\\.0+)?(?=\\s*[;\"'])"
-  + "|(?<![\\w-])color\\s*:\\s*(?:#fff(?:fff)?\\b|white\\b|rgba?\\(\\s*255\\s*,\\s*255\\s*,\\s*255)"
-  + "|(?:left|top|text-indent)\\s*:\\s*-\\d{3,})[^\"']*[\"']"
-  + "|class\\s*=\\s*[\"'][^\"']*\\b(?:hidden|invisible|sr-only|visually-hidden|d-none)\\b[^\"']*[\"'])[^>]*>"
-  + "(?<body>[\\s\\S]*?)</\\k<tag>\\s*>", "gi");
-const TAGS = /<[^>]+>/g;
-
-// [text without invisible characters, index map back into text]
-function visible(text) {
-  const chars = [];
-  const index = [];
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === "\uDB40" && i + 1 < text.length && text.charCodeAt(i + 1) >= 0xDC00 && text.charCodeAt(i + 1) <= 0xDC7F) {
-      i += 1;
-      continue;
-    }
-    if (INVISIBLE_CHARS.indexOf(ch) !== -1) continue;
-    chars.push(ch);
-    index.push(i);
-  }
-  return [chars.join(""), index];
-}
-
-function instructionSpans(text) {
-  return spansOf(INSTRUCTION, text)
-    .concat(phraseSpans(text).map((s) => [s[0], s[1]]))
-    .concat(spansOf(SHELL, text));
-}
-
-function hiddenSpans(text) {
-  const spans = [];
-  let start = text.indexOf("<!--");
-  while (start !== -1) {
-    const end = text.indexOf("-->", start + 4);
-    if (end === -1) break;
-    const body = text.slice(start + 4, end);
-    if (isInstruction(visible(body)[0])) spans.push([start, end + 3, body.trim()]);
-    start = text.indexOf("<!--", end + 3);
-  }
-  for (const m of matches(HIDDEN_ELEMENT, text)) {
-    const body = visible(m.groups.body.replace(TAGS, " "))[0];
-    if (isInstruction(body)) spans.push([m.index, m.index + m[0].length, body.trim()]);
-  }
-  for (const m of matches(TAG_RUN, text)) {
-    let decoded = "";
-    for (let i = 1; i < m[0].length; i += 2) {
-      const c = m[0].charCodeAt(i) - 0xDC00;
-      if (c >= 0x20 && c <= 0x7e) decoded += String.fromCharCode(c);
-    }
-    if (isInstruction(decoded)) spans.push([m.index, m.index + m[0].length, decoded]);
-  }
-  if (INVISIBLE_RE.test(text)) {
-    const [vis, index] = visible(text);
-    for (const [s, e] of instructionSpans(vis)) {
-      const oStart = index[s];
-      const oEnd = index[e - 1] + 1;
-      if (INVISIBLE_RE.test(text.slice(oStart, oEnd))) spans.push([oStart, oEnd, vis.slice(s, e)]);
-    }
-  }
-  return spans;
-}
-
-function bySpan(a, b) {
-  return a[0] - b[0] || a[1] - b[1];
-}
-
-/** The instructions hidden in text (HTML comments, invisible elements, zero-width or Unicode tag characters), made readable. */
-export function findHiddenPrompts(text) {
-  if (typeof text !== "string" || !text) return [];
-  return hiddenSpans(text).sort(bySpan).map((s) => s[2]);
-}
-
-/** text with each hidden instruction replaced by <hidden_prompts_removed>; same type in, same type out. */
-export function removeHiddenPrompts(text) {
-  if (typeof text !== "string") return structured(text, removeHiddenPrompts);
-  const spans = hiddenSpans(text);
-  return spans.length ? replaceSpans(text, spans, "<hidden_prompts_removed>") : text;
-}
-
-// Encoded: base64 (standard or URL-safe, padded or not), hex, percent-encoding and ROT13,
-// up to two layers; a span is removed only when its decoded text is an instruction.
-const B64_TOKEN = /(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/=_-])/g;
-const HEX_TOKEN = /(?<![0-9A-Fa-f])(?:\\x)?(?:[0-9A-Fa-f]{2}(?:\\x)?){8,}(?![0-9A-Fa-f])/g;
-const PCT_TOKEN = /(?<![^\s"'<>])[^\s"'<>%]*%[0-9A-Fa-f]{2}[^\s"'<>]*/g;
-const JOINED_STRINGS = /^["']\s*\+\s*["']$/;
-
-function rot13(text) {
-  return text.replace(/[A-Za-z]/g, (c) => {
-    const base = c <= "Z" ? 65 : 97;
-    return String.fromCharCode((c.charCodeAt(0) - base + 13) % 26 + base);
-  });
-}
-
-function printable(decoded) {
-  if (!decoded) return false;
-  const chars = Array.from(decoded);
-  return chars.filter(isPrintableOrSpace).length >= 0.95 * chars.length;
-}
-
-function utf8(bytes) {
-  try {
-    if (typeof TextDecoder === "undefined") return null;
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch (e) {
-    return null;
-  }
-}
-
-// Readable text token decodes to (base64 / hex / percent), else null.
-function decodeToken(token) {
-  const raw = token.split("\\x").join("");
-  if (token.indexOf("%") !== -1) {
-    if ((token.match(/%[0-9A-Fa-f]{2}/g) || []).length < 4) return null;
-    let decoded;
-    try {
-      decoded = decodeURIComponent(token);
-    } catch (e) {
-      return null;
-    }
-    return decoded !== token && printable(decoded) ? decoded : null;
-  }
-  if (/^(?:[0-9A-Fa-f]{2}){8,}$/.test(raw)) {
-    const bytes = new Uint8Array(raw.length / 2);
-    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(raw.substr(i * 2, 2), 16);
-    const decoded = utf8(bytes);
-    if (decoded !== null && printable(decoded)) return decoded;
-  }
-  const body = token.replace(/=+$/, "").replace(/-/g, "+").replace(/_/g, "/");
-  if (body.length % 4 === 1 || !/^[A-Za-z0-9+/]+$/.test(body)) return null;
-  const decoded = decodeBase64(body + "=".repeat((4 - (body.length % 4)) % 4));
-  return decoded !== null && printable(decoded) ? decoded : null;
-}
-
-function decodedInstruction(decoded, depth) {
-  depth = depth || 1;
-  if (isInstruction(decoded)) return decoded;
-  if (depth < 2) {
-    for (const rx of [B64_TOKEN, HEX_TOKEN, PCT_TOKEN]) {
-      for (const m of matches(rx, decoded)) {
-        const inner = decodeToken(m[0]);
-        if (inner && decodedInstruction(inner, depth + 1)) return inner;
-      }
-    }
-  }
-  return null;
-}
-
-function encodedSpansWide(text) {
-  const spans = [];
-  const pieces = [];
-  for (const rx of [B64_TOKEN, HEX_TOKEN, PCT_TOKEN]) {
-    for (const m of matches(rx, text)) {
-      const decoded = decodeToken(m[0]);
-      if (decoded === null) continue;
-      const end = m.index + m[0].length;
-      pieces.push([m.index, end, decoded]);
-      const found = decodedInstruction(decoded);
-      if (found) spans.push([m.index, end, found]);
-    }
-  }
-  // A payload split over concatenated string literals ("SWdu..." + "aW5z...").
-  pieces.sort(bySpan);
-  for (let i = 0; i < pieces.length - 1; i++) {
-    const a = pieces[i];
-    const b = pieces[i + 1];
-    const gap = text.slice(a[1], b[0]).trim();
-    if (JOINED_STRINGS.test(gap) || !gap) {
-      const joined = a[2] + b[2];
-      if (isInstruction(joined) && !(isInstruction(a[2]) && isInstruction(b[2]))) spans.push([a[0], b[1], joined]);
-    }
-  }
-  for (const [lineStart, line] of linesWithOffsets(text)) {
-    const rotated = rot13(line);
-    for (const [s, e] of instructionSpans(rotated)) {
-      if (!instructionSpans(line.slice(s, e)).length) spans.push([lineStart + s, lineStart + e, rotated.slice(s, e)]);
-    }
-  }
-  return spans;
-}
-
-/** The decoded instructions found in text (empty array: none). */
-export function findEncodedPrompts(text) {
-  if (typeof text !== "string" || !text) return [];
-  return encodedSpansWide(text).sort(bySpan).map((s) => s[2]);
-}
-
-/** text with each encoded instruction (base64, URL-safe base64, hex, percent, ROT13) replaced by <encoded_prompts_removed>. */
-export function removeEncodedPrompts(text) {
-  if (typeof text !== "string") return structured(text, removeEncodedPrompts);
-  const spans = encodedSpansWide(text);
-  return spans.length ? replaceSpans(text, spans, "<encoded_prompts_removed>") : text;
-}
-
-// Leetspeak: each letter also matches its usual substitutes (1 ! | for i and l, 3 for e,
-// 0 for o, 4 @ for a, 5 $ for s, 7 + for t ...); letters may be spaced out, with a wider
-// gap between words. A match of this wider list counts only if it uses a substitute or
-// spaced letters; the plain phrases sanitizePrompt removes are removed too.
-const LEET_LETTERS = { a: "a4@", b: "b8", e: "e3", g: "g96", i: "i1!|l", l: "l1|i", o: "o0", s: "s5$", t: "t7+", z: "z2" };
-
-function leetWord(word) {
-  return Array.from(word).map((ch) => "[" + (LEET_LETTERS[ch] || ch).replace(/[\\\]^-]/g, "\\$&") + "]").join(" ?");
-}
-
-function leetAny(words) {
-  return "(?:" + words.slice().sort((a, b) => b.length - a.length).map(leetWord).join("|") + ")";
-}
-
-const GAP = "\\s+";
-const LEET_PROMPT = new RegExp(
-  leetAny(["ignore", "disregard", "forget", "override", "bypass"]) + GAP
-  + "(?:" + leetAny(["all", "any", "the", "your", "my", "previous", "prior", "above", "earlier",
-                     "safety", "system", "original"]) + GAP + "){0,3}"
-  + leetAny(["instructions", "instruction", "rules", "guidelines", "restrictions", "prompt",
-             "prompts", "filters", "policies", "policy"])
-  + "|" + leetAny(["you"]) + GAP + leetAny(["are"]) + GAP + leetAny(["now"]) + GAP
-  + "(?:" + leetAny(["in", "an", "a"]) + GAP + ")?"
-  + leetAny(["dan", "unrestricted", "unfiltered", "jailbroken", "evil", "developer", "admin", "god"])
-  + "|" + leetAny(["reveal", "print", "show", "dump", "leak", "send"]) + GAP
-  + "(?:" + leetAny(["the", "your", "all", "me"]) + GAP + "){0,2}"
-  + leetAny(["system", "secrets", "secret", "passwords", "password", "credentials", "api"])
-  + "(?:" + GAP + leetAny(["prompt", "keys", "key"]) + ")?",
-  "gi");
-const LEET_MARK = /[0-9@$!|+]|(?<![A-Za-z])[A-Za-z] [A-Za-z] [A-Za-z](?![A-Za-z])/;
-
-function leetspeakSpans(text) {
-  const spans = phraseSpans(text).map(([s, e]) => [s, e, text.slice(s, e)]);
-  for (const [lineStart, line] of linesWithOffsets(text)) {
-    for (const m of matches(LEET_PROMPT, line)) {
-      // The rest of the line belongs to the same instruction ("... 4nd r3v34l ...").
-      if (LEET_MARK.test(m[0])) spans.push([lineStart + m.index, lineStart + line.trimEnd().length, m[0]]);
-    }
-    const folded = foldLeet(line);
-    if (folded !== line && hasShell(folded) && !hasShell(line)) {
-      const lead = line.length - line.replace(/^\s+/, "").length;
-      spans.push([lineStart + lead, lineStart + line.trimEnd().length, folded.trim()]);
-    }
-  }
-  return spans;
-}
-
-/** The leetspeak or letter-spaced instructions found in text (empty array: none). */
-export function findLeetspeakPrompts(text) {
-  if (typeof text !== "string" || !text) return [];
-  return leetspeakSpans(text).sort(bySpan).map(([s, e]) => text.slice(s, e));
-}
-
-/** text with each leetspeak or letter-spaced instruction (and the plain phrases sanitizePrompt removes) replaced by <leetspeak_prompts_removed>. */
-export function removeLeetspeakPrompts(text) {
-  if (typeof text !== "string") return structured(text, removeLeetspeakPrompts);
-  const spans = leetspeakSpans(text);
-  return spans.length ? replaceSpans(text, spans, "<leetspeak_prompts_removed>") : text;
-}
-
-// Command requests (AI_APP_SEC_059): a request to run a shell command or code with a
-// target. A word or file name on its own (exec, bash, setup.sh) or a question about one
-// is not a request.
-const RUN_VERB = "\\b(?:run|execute|exec|eval|evaluate|launch)\\b\\s*:?\\s*[`\"']?";
-const COMMAND_REQUEST = [
-  ["shell_command", new RegExp(RUN_VERB + CMD, "gi")],
-  ["shell_command", new RegExp(RUN_VERB + "(?:sudo\\s+)?(?:bash|sh|zsh|ksh|python3?|node|perl|ruby|php|"
-                               + "powershell|pwsh|cmd)\\s+(?:-\\w+\\s+)?\\S", "gi")],
-  ["code_execution", new RegExp(RUN_VERB + "[\\w.]+\\([^)\\n]*\\)", "g")],
-  ["secret_access", new RegExp(
-    "\\b(?:cat|type|print|echo|read|dump|show|send)\\b[^\\n]{0,40}"
-    + "(?:/etc/(?:passwd|shadow)|os\\.environ|process\\.env|\\.ssh/|\\.aws/credentials|\\$[A-Z_]*(?:KEY|TOKEN|SECRET))",
-    "gi")]
-];
-
-function commandRequestSpans(text) {
-  const spans = [];
-  for (const [category, pattern] of COMMAND_REQUEST) {
-    for (const m of matches(pattern, text)) spans.push([m.index, m.index + m[0].length, category]);
-  }
-  return spans;
-}
-
-function commandFindings(text, found) {
-  for (const s of commandRequestSpans(text)) found.add(s[2]);
-  if (matches(SHELL, text).length) found.add("shell_command");
-  for (const name of findCodeExecution(text)) found.add(name === "pipe_to_shell" ? "pipe_to_shell" : "code_execution");
-}
-
-/**
- * The kinds of command-execution request in value (empty array: none): shell commands,
- * code execution, piping a download into a shell, reading secrets; also when the request
- * is hidden, encoded or written in leetspeak. Accepts a string, a list of chat messages or
- * an object. The caller refuses the request (HTTP 400) and logs a fingerprint of it,
- * never the text.
- */
-export function findCommandRequests(value) {
-  const pieces = [];
-  if (typeof value === "string") pieces.push(value);
-  else structured(value, (s) => { pieces.push(s); return s; });
-  const found = new Set();
-  for (const piece of pieces) {
-    if (!piece) continue;
-    const variants = [piece, visible(piece)[0], foldLeet(piece)]
-      .concat(hiddenSpans(piece).map((s) => s[2]))
-      .concat(encodedSpansWide(piece).map((s) => s[2]));
-    for (const variant of variants) commandFindings(variant, found);
-  }
-  return Array.from(found).sort();
-}
 '''
 _UNIFAI_GUARD_DTS_SOURCE = r'''// Types for unifaiGuard.js, the prompt-injection and PII guard added by Lineaje UnifAI remediation.
 // UNIFAI-GUARD owner="Lineaje UnifAI": generated by UnifAI remediation scans; do not edit.
@@ -3208,27 +2338,6 @@ export declare function findShellCommands(text: unknown): string[];
 
 /** Uploaded or fetched content with each shell command replaced by <suspicious_content_removed>. */
 export declare function removeSuspiciousContent<T>(text: T): T;
-
-/** The instructions hidden in text (HTML comments, invisible elements, zero-width or Unicode tag characters), made readable. */
-export declare function findHiddenPrompts(text: unknown): string[];
-
-/** text with each hidden instruction replaced by <hidden_prompts_removed>; same type in, same type out. */
-export declare function removeHiddenPrompts<T>(text: T): T;
-
-/** The decoded instructions found in text (base64, URL-safe base64, hex, percent, ROT13). */
-export declare function findEncodedPrompts(text: unknown): string[];
-
-/** text with each encoded instruction replaced by <encoded_prompts_removed>; same type in, same type out. */
-export declare function removeEncodedPrompts<T>(text: T): T;
-
-/** The leetspeak or letter-spaced instructions found in text (empty array: none). */
-export declare function findLeetspeakPrompts(text: unknown): string[];
-
-/** text with each leetspeak or letter-spaced instruction replaced by <leetspeak_prompts_removed>; same type in, same type out. */
-export declare function removeLeetspeakPrompts<T>(text: T): T;
-
-/** The kinds of command-execution request in a prompt, chat message list or object (empty array: none); refuse the request when any is found. */
-export declare function findCommandRequests(value: unknown): string[];
 '''
 # --- END UNIFAI_GUARD_SOURCE ---
 
@@ -4203,8 +3312,7 @@ def parallel_batch_scan(
     all_aibom: List[Dict[str, str]] = []
     all_stub_insertions: List[Dict[str, Any]] = []
     # What the server PUT to Lineaje S3, plus whether any batch's source archive went too.
-    uploaded: Dict[str, Any] = {"entities": [], "findings": [], "source_archive_s3_uploaded": None,
-                                "shared_guard": None}
+    uploaded: Dict[str, Any] = {"entities": [], "findings": [], "source_archive_s3_uploaded": None}
     aibom_seen: set = set()
     failed_batch_count = 0
     failure_details: List[str] = []
@@ -4300,8 +3408,6 @@ def parallel_batch_scan(
                 all_reports.append(batch_report)
             uploaded["entities"].extend(mcp_result.get("uploaded_entities_json") or [])
             uploaded["findings"].extend(mcp_result.get("uploaded_findings_json") or [])
-            if isinstance(mcp_result.get("shared_guard"), dict) and not uploaded["shared_guard"]:
-                uploaded["shared_guard"] = mcp_result["shared_guard"]
             src_flag = mcp_result.get("source_archive_s3_uploaded")
             if src_flag is not None:
                 uploaded["source_archive_s3_uploaded"] = bool(
@@ -5838,8 +4944,6 @@ def _execute_scan(args: argparse.Namespace) -> int:
             row for row in fix_table
             if _norm_stub_relpath(row.get("file") or "") not in gated_paths
         ]
-    if validated_fixes:
-        _use_server_guard(uploaded.get("shared_guard"))
     failed_rem_files.extend(_add_shared_guard_files(validated_fixes, source_path, fix_table))
 
     fix_branch_name = (getattr(args, "fix_branch", None) or "").strip()
