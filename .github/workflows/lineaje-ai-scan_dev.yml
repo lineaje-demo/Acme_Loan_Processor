@@ -1,4 +1,4 @@
-name: Lineaje UnifAI Scan
+name: Lineaje UnifAI Scan Dev
 
 on:
   workflow_dispatch:
