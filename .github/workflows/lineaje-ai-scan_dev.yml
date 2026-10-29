@@ -36,7 +36,7 @@ jobs:
       - name: Prepare scan output folder
         run: |
           # Built from the runner's GITHUB_* variables: no context expressions inside run:.
-          RUN_DIR="/home/azureuser/unifai-scans/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}-${GITHUB_SHA::7}-${GITHUB_RUN_ID}"
+          RUN_DIR="/tmp/unifai-scans/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}-${GITHUB_SHA::7}-${GITHUB_RUN_ID}"
           mkdir -p "$RUN_DIR/source" "$RUN_DIR/tarballs"
           echo "UNIFAI_RUN_DIR=$RUN_DIR" >> "$GITHUB_ENV"
           touch "$RUN_DIR/.started"
