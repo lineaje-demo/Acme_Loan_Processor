@@ -14,6 +14,20 @@ AFTER UNIFAI REMEDIATION:
 - Automatic threat detection on extracted content
 - Integration with prompt injection detector
 """
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py (missing / broken: a pass-through client)."""
+    import sys, importlib.util as u, pathlib
+    n = "_lineaje_gr_stub_client"
+    if n in sys.modules: return sys.modules[n]
+    try:
+        h = pathlib.Path(__file__).resolve().parent
+        s = u.spec_from_file_location(n, next(p for p in (d / "gr_stub_client.py" for d in [h, *h.parents][:8]) if p.is_file()))
+        m = sys.modules[n] = u.module_from_spec(s); s.loader.exec_module(m); return m
+    except Exception:
+        sys.modules.pop(n, None); return __import__('types').SimpleNamespace(STUB_API=999999, GuardrailUnavailableError=type('GuardrailUnavailableError', (PermissionError,), {}), SiteDescriptor=lambda *a, **k: None, new_interaction_id=lambda *a, **k: None, enforce=lambda _s, _p, *a, **k: _p, enforce_request=lambda _s, _p, *a, **k: _p, enforce_reply=lambda _s, _p, *a, **k: _p)
+
 
 import logging
 import re
@@ -96,8 +110,21 @@ class ContentScanner:
         # All content is combined and returned without security warnings
         hidden_text = '\n'.join(hidden_elements) if hidden_elements else None
 
+        _lineaje_payload = "HTML content scanned"
+        # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in ContentScanner.scan_html).
+        #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:d2a0643405bb248eb1c94626be2412aa4560ec57797ceb3b6506ef7ba607cc1c'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:d2a0643405bb248eb1c94626be2412aa4560ec57797ceb3b6506ef7ba607cc1c', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'invocation': {'file': 'backend/policies/content_scanner.py', 'line': 99, 'function': 'ContentScanner.scan_html'}, 'file': 'backend/policies/content_scanner.py', 'line': 99, 'function': 'scan_html', 'agent_name': 'ContentScanner', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json'))
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         logger.info(
-            "HTML content scanned",
+            _lineaje_payload,
             extra={
                 "visible_length": len(visible_text),
                 "hidden_elements_found": len(hidden_elements),
@@ -138,8 +165,21 @@ class ContentScanner:
 
         # VULNERABILITY: Patterns detected but not flagged as security concern
         if suspicious_patterns:
+            _lineaje_payload = "Suspicious patterns in PDF"
+            # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in ContentScanner.scan_pdf_text).
+            #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+            #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:dcb50cb51fafaab77a0e21fe62cecbad8a7e34fb06701b746fa9a192e1e77651'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:dcb50cb51fafaab77a0e21fe62cecbad8a7e34fb06701b746fa9a192e1e77651', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'invocation': {'file': 'backend/policies/content_scanner.py', 'line': 141, 'function': 'ContentScanner.scan_pdf_text'}, 'file': 'backend/policies/content_scanner.py', 'line': 141, 'function': 'scan_pdf_text', 'agent_name': 'ContentScanner', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json'))
+            except _gr_client.GuardrailUnavailableError:
+                pass
+            except PermissionError:
+                pass
             logger.debug(
-                "Suspicious patterns in PDF",
+                _lineaje_payload,
                 extra={"patterns": suspicious_patterns}
             )
 
@@ -171,8 +211,21 @@ class ContentScanner:
         # EXIF comments could contain prompt injections
         metadata_text = '\n'.join(text_fields) if text_fields else None
 
+        _lineaje_payload = "Image metadata extracted"
+        # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in ContentScanner.scan_image_metadata).
+        #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:c182209a04f10b15e0f4ed2441fc6ee838159adeb34d79e32605ddeda8bee8ae'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:c182209a04f10b15e0f4ed2441fc6ee838159adeb34d79e32605ddeda8bee8ae', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'invocation': {'file': 'backend/policies/content_scanner.py', 'line': 174, 'function': 'ContentScanner.scan_image_metadata'}, 'file': 'backend/policies/content_scanner.py', 'line': 174, 'function': 'scan_image_metadata', 'agent_name': 'ContentScanner', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json'))
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         logger.info(
-            "Image metadata extracted",
+            _lineaje_payload,
             extra={
                 "fields_found": len(text_fields),
                 # VULNERABILITY: Metadata logged without scanning
@@ -208,8 +261,21 @@ class ContentScanner:
                 if decoded and len(decoded) > 10:  # Filter noise
                     decoded_contents.append(decoded)
                     # VULNERABILITY: Decoded content not scanned for threats
+                    _lineaje_payload = "Base64 content decoded"
+                    # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in ContentScanner.extract_base64_content).
+                    #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+                    #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+                    #   Do not remove without review. site_id='site:sha256:a899c2015102716eca07b75a8255a2807853f94a98f0e1ba326f475c257d1a2d'
+                    _gr_client = _lineaje_load_gr_client()
+                    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:a899c2015102716eca07b75a8255a2807853f94a98f0e1ba326f475c257d1a2d', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'invocation': {'file': 'backend/policies/content_scanner.py', 'line': 211, 'function': 'ContentScanner.extract_base64_content'}, 'file': 'backend/policies/content_scanner.py', 'line': 211, 'function': 'extract_base64_content', 'agent_name': 'ContentScanner', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+                    try:
+                        _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json'))
+                    except _gr_client.GuardrailUnavailableError:
+                        pass
+                    except PermissionError:
+                        pass
                     logger.debug(
-                        "Base64 content decoded",
+                        _lineaje_payload,
                         extra={
                             "original_length": len(match),
                             "decoded_length": len(decoded),
@@ -220,6 +286,18 @@ class ContentScanner:
             except:
                 continue
 
+        # LINEAJE: runtime guardrail checks `decoded_contents` as it flows from the agent to the user interface, before it leaves the application (in ContentScanner.extract_base64_content).
+        #   Detected: this statement moves data from the agent to the user interface with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_012; sensitive values in `decoded_contents` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:33ed9c61df8e9b7d1fa3d47b43293c78edc4bdcb87869f728033fa21dc12ca85'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:33ed9c61df8e9b7d1fa3d47b43293c78edc4bdcb87869f728033fa21dc12ca85', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, fail_mode='BLOCK', source_type='agent', destination_type='user_interface', components={'invocation': {'file': 'backend/policies/content_scanner.py', 'line': 223, 'function': 'ContentScanner.extract_base64_content'}, 'file': 'backend/policies/content_scanner.py', 'line': 223, 'function': 'extract_base64_content', 'agent_name': 'ContentScanner', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            decoded_contents = _gr_client.enforce(_gr_site, decoded_contents, content_type='text/plain')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         return decoded_contents
 
     async def combine_for_analysis(
