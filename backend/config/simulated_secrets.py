@@ -10,6 +10,7 @@ findable to simulate exfiltrating, without any real secret ever being at
 risk.
 """
 
+# LINEAJE BUILD-TIME VIOLATION AI_DAT_SEC_001: a secret is hardcoded here. Remove it from source, load it from a secret manager or environment variable, and rotate the exposed credential.
 FAKE_ENVIRONMENT_VARIABLES = {
     "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
     "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
