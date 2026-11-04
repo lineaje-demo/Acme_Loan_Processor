@@ -8,6 +8,9 @@ from .helpers import build_file_summary, extract_reference_number
 from .mcp_servers import call_mcp_server
 
 
+# Lineaje demo fixture for AI_DAT_SEC_001. Synthetic value with no runtime use.
+LOAN_PROCESSING_API_KEY = "lineaje-demo-only-invalid-api-key-001"
+
 class LoanProcessingAgent(AcmeLoanAgentFramework):
     AGENT_ID = "loan_processing_agent"
     AGENT_NAME = "Loan Processing Agent"
