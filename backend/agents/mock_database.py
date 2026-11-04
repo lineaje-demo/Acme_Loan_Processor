@@ -1,4 +1,18 @@
 """Mock borrower database seeded from the HP employee details demo PDF."""
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py (missing / broken: a pass-through client)."""
+    import sys, importlib.util as u, pathlib
+    n = "_lineaje_gr_stub_client"
+    if n in sys.modules: return sys.modules[n]
+    try:
+        h = pathlib.Path(__file__).resolve().parent
+        s = u.spec_from_file_location(n, next(p for p in (d / "gr_stub_client.py" for d in [h, *h.parents][:8]) if p.is_file()))
+        m = sys.modules[n] = u.module_from_spec(s); s.loader.exec_module(m); return m
+    except Exception:
+        sys.modules.pop(n, None); return __import__('types').SimpleNamespace(STUB_API=999999, GuardrailUnavailableError=type('GuardrailUnavailableError', (PermissionError,), {}), SiteDescriptor=lambda *a, **k: None, new_interaction_id=lambda *a, **k: None, enforce=lambda _s, _p, *a, **k: _p, enforce_request=lambda _s, _p, *a, **k: _p, enforce_reply=lambda _s, _p, *a, **k: _p)
+
 
 import base64
 from copy import deepcopy
@@ -133,6 +147,18 @@ def search_borrower_records(query: str) -> list[dict[str, Any]]:
             continue
         if searchable_tokens and all(token in haystack for token in searchable_tokens):
             matches.append(ensure_credit_score(record))
+    # LINEAJE: runtime guardrail checks `matches` as it flows from the agent to the user interface, before it leaves the application (in search_borrower_records).
+    #   Detected: this statement moves data from the agent to the user interface with no runtime policy check (detection confidence: medium).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_012; sensitive values in `matches` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:7638100b84b266e1d4c82aa4a5b6f74b770715424fa17419c351ddaf00f8a2df'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:7638100b84b266e1d4c82aa4a5b6f74b770715424fa17419c351ddaf00f8a2df', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, fail_mode='BLOCK', source_type='agent', destination_type='user_interface', components={'invocation': {'file': 'backend/agents/mock_database.py', 'line': 136, 'function': 'search_borrower_records'}, 'file': 'backend/agents/mock_database.py', 'line': 136, 'function': 'search_borrower_records', 'agent_name': 'search_borrower_records', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        matches = _gr_client.enforce(_gr_site, matches, content_type='text/plain')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
     return matches or [ensure_credit_score(_MOCK_BORROWER_RECORDS[0])]
 
 
@@ -141,6 +167,18 @@ def ensure_credit_score(record: dict[str, Any]) -> dict[str, Any]:
     if "credit_score" not in borrower:
         deterministic_seed = sum(ord(char) for char in borrower["employee_id"])
         borrower["credit_score"] = 640 + (deterministic_seed % 91)
+    # LINEAJE: runtime guardrail checks `borrower` as it flows from the agent to the user interface, before it leaves the application (in ensure_credit_score).
+    #   Detected: this statement moves data from the agent to the user interface with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_012; sensitive values in `borrower` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:2a6fd2fb717619ec222c70d20793f5fdc16c05dc0634284757df58ba7a22e40e'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:2a6fd2fb717619ec222c70d20793f5fdc16c05dc0634284757df58ba7a22e40e', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, fail_mode='BLOCK', source_type='agent', destination_type='user_interface', components={'invocation': {'file': 'backend/agents/mock_database.py', 'line': 144, 'function': 'ensure_credit_score'}, 'file': 'backend/agents/mock_database.py', 'line': 144, 'function': 'ensure_credit_score', 'agent_name': 'ensure_credit_score', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        borrower = _gr_client.enforce(_gr_site, borrower, content_type='text/plain')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
     return borrower
 
 
@@ -168,6 +206,18 @@ def search_support_cases(query: str) -> list[dict[str, Any]]:
         if searchable_tokens and all(token in haystack for token in searchable_tokens):
             matches.append(deepcopy(record))
 
+    # LINEAJE: runtime guardrail checks `matches` as it flows from the agent to the user interface, before it leaves the application (in search_support_cases).
+    #   Detected: this statement moves data from the agent to the user interface with no runtime policy check (detection confidence: medium).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_012; sensitive values in `matches` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:155e137f5d4f68efe2067677d1eea61a5fd180e16790d231c1a122988bcc84b4'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:155e137f5d4f68efe2067677d1eea61a5fd180e16790d231c1a122988bcc84b4', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, fail_mode='BLOCK', source_type='agent', destination_type='user_interface', components={'invocation': {'file': 'backend/agents/mock_database.py', 'line': 171, 'function': 'search_support_cases'}, 'file': 'backend/agents/mock_database.py', 'line': 171, 'function': 'search_support_cases', 'agent_name': 'search_support_cases', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        matches = _gr_client.enforce(_gr_site, matches, content_type='text/plain')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
     return matches or [deepcopy(_MOCK_SUPPORT_CASES[0])]
 
 
