@@ -15,7 +15,7 @@ permissions:
 jobs:
   lineaje-scan:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,17 +36,15 @@ jobs:
       - name: Run Lineaje AI policy scan
         env:
           LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
-          # Remediation PR token. GITHUB_TOKEN cannot open PRs when the org disables
-          # "Allow GitHub Actions to create and approve pull requests"; set the
-          # LINEAJE_FIX_PR_TOKEN secret (fine-grained PAT or GitHub App token with
-          # Contents + Pull requests: Read and write on this repo) to use it instead.
-          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
-          MCP_TLS_INSECURE_SKIP_VERIFY: "1"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Keep TLS verification enabled.
+          MCP_TLS_INSECURE_SKIP_VERIFY: "0"
         run: |
           python /tmp/scm_unifai_scan_hybrid.py \
             --source-path . \
-            --repo ${{ github.repository }} \
-            --branch ${{ github.ref_name }} \
-            --head-sha ${{ github.sha }} \
-            --mcp-server-url https://mcp-code.v2.prod.veedna.com/mcp \
+            --repo "$GITHUB_REPOSITORY" \
+            --branch "$GITHUB_REF_NAME" \
+            --head-sha "$GITHUB_SHA" \
+            --mcp-server-url https://mcp.commercialdev.dev.veedna.com/mcp \
+            --pr-mode direct \
             ${{ inputs.create_fix_pr && '--create-fix-pr' || '' }} >> "$GITHUB_STEP_SUMMARY"

@@ -2,11 +2,12 @@
 """Lineaje UnifAI Policy Scanner — GitHub Actions edition.
 
 Scans already-checked-out source code against Lineaje AI security policies and
-optionally opens a remediation PR built from the LLM remediation ``fix_code`` patches
-the policy engine returns (guardrail stubs, ``gr_stub_client.py`` and
-``.env`` files are never inserted; each patched Python file must still compile and
-define every name it uses, or its fix is dropped); the PR commits the
-patched files. The step summary also prints the exact ``entities.aientity.json`` and
+optionally opens a code-fix PR from the LLM remediation ``fix_code`` the policy
+engine returns: each fix is added as a comment above the code it applies to, and the
+flagged code itself is never changed or removed (guardrail stubs, ``gr_stub_client.py``
+and ``.env`` files go to the separate instrumentation PR). When an open UnifAI PR of
+the same kind already targets the branch, this scan's changes are committed to it
+instead of opening another PR. The step summary also prints the exact ``entities.aientity.json`` and
 ``findings.aifinding.json`` the server uploaded to Lineaje — in hybrid mode those are
 the only scan artifacts that leave the MCP host. Designed to run on a GitHub-managed
 (or self-hosted) runner where the repository is already checked out.
@@ -40,7 +41,10 @@ Required environment variable::
 
 Optional environment variables::
 
-    GITHUB_TOKEN / GH_TOKEN  — needed by --create-fix-pr to push the branch and open the PR
+    GITHUB_TOKEN / GH_TOKEN  — with --create-fix-pr, this script opens the PRs itself (--pr-mode direct)
+    UNIFAI_PR_MODE           — direct, explain or mcp (default: direct with a GitHub token, else explain)
+    LINEAJE_GPT_SERVICE_URL  — override the Lineaje GPT service (--pr-mode explain)
+    LINEAJE_PRODUCT_ID       — product id sent to the GPT service (default: the token's, else 1)
     UNIFAI_FILE_BATCH_SIZE   — files per batch (default 100; 0 puts everything in one batch)
     MCP_SERVER_URL           — override the Lineaje MCP endpoint
 
@@ -56,7 +60,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import binascii
 import builtins
+import difflib
 import importlib
 import fnmatch
 import json
@@ -85,7 +91,8 @@ logger = logging.getLogger("gha_repo_scan")
 # Constants
 # ===========================================================================
 
-MCP_SERVER_URL = "https://172.206.26.109/mcp"#"https://172.206.26.109/mcp"  # Put in your VM IP Address here
+MCP_SERVER_URL = "https://mcp.v2.prod.veedna.com/mcp"#"https://172.206.26.109/mcp"  # Put in your VM IP Address here
+GPT_SERVICE_URL =  "https://lineaje-gpt-service.v2.prod.veedna.com"
 
 
 def _mcp_http_client_with_extra_ca(headers=None, timeout=None, auth=None):
@@ -183,11 +190,66 @@ async def _streamablehttp_client_compat(
 
 MAX_SCAN_WORKERS = 4
 REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
+INSTRUMENTATION_BRANCH_PREFIX = "instrumentation/unifai-gha"
+
+# Two kinds of UnifAI pull request, raised separately (they are reviewed differently):
+#   code_fix         changes application logic to remove a build-time policy violation;
+#   instrumentation  inserts guardrail stubs / the SDK so the Guardrail service can observe
+#                    and enforce AI interactions at runtime. It is not a fix.
+# Neither is merged automatically: the repository's normal review process approves them.
+PR_KINDS = ("code_fix", "instrumentation")
+# fix_type tag on MCP response items: which PR a change belongs to.
+FIX_TYPE_CODE_FIX = "code-fix"
+FIX_TYPE_INTERCEPT = "intercept"
+# The only fix types that make a change a code fix (code-fix PR) — the server's own set
+# (data_service_client.CODE_FIX_FIX_TYPES; today "Do not store secrets in code", AI_DAT_SEC_001), plus
+# "build_time", the harness's policy_type for that same comment-only policy. Every other value, and no value
+# at all, is an intercept (guardrail stub, instrumentation PR).
+CODE_FIX_TYPES = frozenset({"code-fix", "code_fix", "code-insert", "code_insert", "build_time"})
+
+
+def _is_code_fix_type(item: Dict[str, Any]) -> bool:
+    return str(item.get("fix_type") or item.get("policy_type") or "").strip().lower() in CODE_FIX_TYPES
+
+
+def _pr_wording(kind: str, branch: str, sha_short: str, files: str = "", policies: str = "") -> Dict[str, str]:
+    """Branch prefix, PR title, commit message and body intro for one kind of UnifAI PR."""
+    if kind == "instrumentation":
+        return {
+            "prefix": INSTRUMENTATION_BRANCH_PREFIX,
+            "title": f"[unifai-bot] instrumentation: runtime guardrail interception for {branch}@{sha_short}",
+            "commit": f"instrument({files}): runtime policy interception for {policies}",
+            "intro": ("**Instrumentation.** This pull request inserts UnifAI guardrail stubs so the Guardrail "
+                      "service can observe and enforce AI interactions at runtime. It does not change "
+                      "application logic and does not fix a build-time violation."),
+            "label": "instrumentation",
+        }
+    return {
+        "prefix": REMEDIATION_BRANCH_PREFIX,
+        "title": f"[unifai-bot] fix: suggested AI policy fixes for {branch}@{sha_short}",
+        "commit": f"fix({files}): suggest fixes for {policies}",
+        "intro": ("**Suggested fixes.** For each build-time policy violation listed below, this pull "
+                  "request adds the UnifAI suggested fix as a comment above the code it applies to. "
+                  "No application code is changed or removed: review each suggestion and apply it by hand."),
+        "label": "remediation",
+    }
 
 # Azure DevOps REST limits for the remediation PR (used by AzureDevOpsClient).
 AZURE_DEVOPS_API_VERSION = "7.1"
 AZURE_PR_TITLE_LIMIT = 400
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
+# A harness batch runs up to the server's UNIFAI_HARNESS_TIMEOUT (default 1800 s) and then uploads and merges, so
+# the analyze call's SSE read timeout must outlast that: 3600 s by default, and never below 3600 s.
+DEFAULT_MCP_SSE_READ_TIMEOUT_S = 3600
+
+
+def mcp_sse_read_timeout() -> int:
+    """``UNIFAI_MCP_SSE_READ_TIMEOUT`` seconds, at least :data:`DEFAULT_MCP_SSE_READ_TIMEOUT_S`."""
+    try:
+        raw = int((os.environ.get("UNIFAI_MCP_SSE_READ_TIMEOUT") or "").strip() or DEFAULT_MCP_SSE_READ_TIMEOUT_S)
+    except ValueError:
+        raw = DEFAULT_MCP_SSE_READ_TIMEOUT_S
+    return max(raw, DEFAULT_MCP_SSE_READ_TIMEOUT_S)
 GITHUB_PR_BODY_SAFE_LIMIT = 60000
 # Azure DevOps rejects PR descriptions longer than 4000 characters.
 AZURE_PR_DESCRIPTION_LIMIT = 4000
@@ -310,6 +372,40 @@ _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
 _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
     "https://lineaje-identity-service.v2.prod.veedna.com"
     "/lineajeidentity/api/v1/auth/native/renew-access-token"
+)
+_LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_DEV = (
+    "https://lineaje-identity-service.commercialdev.dev.veedna.com"
+    "/lineajeidentity/api/v1/auth/native/renew-access-token"
+)
+
+
+_GPT_SERVICE_URL_DEV = "https://lineaje-gpt-service.commercialdev.dev.veedna.com"
+
+
+def _lineaje_env_is_dev() -> bool:
+    """True when MCP_SERVER_URL is a ``*.dev.veedna.com`` host (the dev SaaS scan server, whose
+    tokens prod rejects as invalid_grant)."""
+    host = (urllib.parse.urlsplit(os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL).hostname or "").lower()
+    return host.endswith(".dev.veedna.com")
+
+
+def _native_renew_access_token_url() -> str:
+    """The identity service of the Lineaje environment MCP_SERVER_URL names: commercialdev on a
+    dev host, production otherwise. Either way credentials only go to a Lineaje host."""
+    if _lineaje_env_is_dev():
+        return _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_DEV
+    return _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD
+
+
+def _default_gpt_service_url() -> str:
+    """GPT service for --pr-mode explain when neither --gpt-service-url nor
+    LINEAJE_GPT_SERVICE_URL is set: the same environment as the renew URL."""
+    return _GPT_SERVICE_URL_DEV if _lineaje_env_is_dev() else GPT_SERVICE_URL
+# Where the customer's gr_stub_client.py exchanges its SCIM refresh token (.env.example
+# LINEAJE_RENEW_ACCESS_TOKEN_URL): the SCIM service, since identity cannot decrypt a SCIM token.
+_LINEAJE_SCIM_RENEW_ACCESS_TOKEN_URL_PROD = (
+    "https://scim-service.v2.prod.veedna.com"
+    "/scim/api/v1/auth/native/renew-access-token"
 )
 
 
@@ -513,6 +609,26 @@ class AzureDevOpsClient:
         })
         return int(resp["pullRequestId"])
 
+    def find_active_pull_request(self, target_branch: str, source_prefix: str) -> Optional[Dict[str, Any]]:
+        """The newest active PR into *target_branch* whose source branch starts with
+        *source_prefix*: ``{"number", "head"}``, or None."""
+        data = self._request("GET", self._url(
+            "/pullrequests",
+            **{"searchCriteria.status": "active", "searchCriteria.targetRefName": f"refs/heads/{target_branch}"},
+        ))
+        prefix = f"refs/heads/{source_prefix}"
+        mine = [p for p in (data or {}).get("value", []) if str(p.get("sourceRefName") or "").startswith(prefix)]
+        if not mine:
+            return None
+        pr = max(mine, key=lambda p: int(p.get("pullRequestId") or 0))
+        return {"number": int(pr["pullRequestId"]), "head": str(pr["sourceRefName"])[len("refs/heads/"):]}
+
+    def update_pull_request(self, pr_id: int, *, title: str = "", description: str = "") -> None:
+        payload = {k: v for k, v in (("title", title[:AZURE_PR_TITLE_LIMIT]),
+                                     ("description", description[:AZURE_PR_DESCRIPTION_LIMIT])) if v}
+        if payload:
+            self._request("PATCH", self._url(f"/pullrequests/{pr_id}"), payload)
+
     def pull_request_url(self, pr_id: int) -> str:
         return (
             f"{self.org_url}/{urllib.parse.quote(self.project, safe='')}"
@@ -570,13 +686,40 @@ def _identity_token_response_dict(raw_text: str, *, context: str) -> dict:
     raise RuntimeError(f"{context}: unexpected JSON type after unwrap: {type(parsed).__name__}")
 
 
+def _is_jwt(token: str) -> bool:
+    parts = (token or "").split(".")
+    return len(parts) == 3 and all(parts)
+
+
+def _keycloak_refresh_target(refresh_token: str) -> Tuple[str, str]:
+    """``(token endpoint, client id)`` for a Keycloak refresh token (the UI's login token, as the
+    SaaS scan queue gets it): its issuer's ``/protocol/openid-connect/token`` and its ``azp``
+    (``LINEAJE_IDP_CLIENT_ID`` overrides). ``("", "")`` when it is not one or its issuer is not a
+    Lineaje host — the token is never sent anywhere else."""
+    if not _is_jwt(refresh_token):
+        return "", ""
+    try:
+        body = refresh_token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return "", ""
+    issuer = str(claims.get("iss") or "").rstrip("/") if isinstance(claims, dict) else ""
+    parts = urllib.parse.urlsplit(issuer)
+    if parts.scheme != "https" or not (parts.hostname or "").lower().endswith(".veedna.com"):
+        if issuer:
+            logger.warning("Refresh token issuer %r is not a Lineaje IdP: not exchanging it", issuer)
+        return "", ""
+    client_id = (os.environ.get("LINEAJE_IDP_CLIENT_ID") or str(claims.get("azp") or "")).strip()
+    return f"{issuer}/protocol/openid-connect/token", client_id
+
+
 class RefreshTokenTokenManager:
     """Exchange LINEAJE_PAT_TOKEN at the production identity endpoint.
 
     The hybrid scanner intentionally does not honor endpoint overrides for
-    refresh-token exchange. Customer CI configuration may change the MCP
-    endpoint, but credentials must always be renewed by the production Lineaje
-    identity service.
+    refresh-token exchange: credentials are always renewed by a Lineaje
+    identity service — commercialdev when MCP_SERVER_URL is a dev host,
+    production otherwise (``_native_renew_access_token_url``).
     """
 
     def __init__(self, refresh_token: str, renew_access_token_url: Optional[str] = None) -> None:
@@ -585,7 +728,11 @@ class RefreshTokenTokenManager:
             raise ValueError("LINEAJE_PAT_TOKEN must be non-empty")
         # Keep the optional argument for call-site compatibility, but never let
         # it or LINEAJE_RENEW_ACCESS_TOKEN_URL redirect credentials elsewhere.
-        self._renew_url = _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD
+        self._renew_url = _native_renew_access_token_url()
+        # A Keycloak refresh token (the UI's login token, which the SaaS scan queue gets in
+        # input.json) is not one renew-access-token takes ("Illegal base64 character 2e"): it is
+        # exchanged at its own issuer (grant_type=refresh_token), which needs the client's secret.
+        self._keycloak_url, self._keycloak_client = _keycloak_refresh_target(self._refresh_token)
         self._lock = threading.Lock()
         self._access_token = ""
         self._access_deadline = 0.0
@@ -600,6 +747,14 @@ class RefreshTokenTokenManager:
         with self._lock:
             return self._get_unlocked()
 
+    def issue_refresh_token(self) -> str:
+        """A Lineaje refresh token from renew-access-token, for the customer's runtime
+        stubs (``LINEAJE_REFRESH_TOKEN``). Calls the API now; when the response carries
+        no new ``refresh_token``, the current one (still valid) is returned."""
+        with self._lock:
+            self._renew()
+            return self._refresh_token
+
     def _get_unlocked(self) -> str:
         now = time.time()
         if self._access_token and now < self._access_deadline - self._skew_sec:
@@ -610,6 +765,9 @@ class RefreshTokenTokenManager:
         return self._access_token
 
     def _renew(self) -> None:
+        if self._keycloak_url:
+            self._renew_at_keycloak()
+            return
         q = urllib.parse.urlencode({"refreshToken": self._refresh_token})
         url = f"{self._renew_url}?{q}"
         req = urllib.request.Request(
@@ -639,12 +797,50 @@ class RefreshTokenTokenManager:
         logger.debug("Access token renewed; expires in %ds", exp_sec)
 
 
+    def _renew_at_keycloak(self) -> None:
+        """``grant_type=refresh_token`` at the token's issuer, as client ``azp`` with
+        ``LINEAJE_IDP_CLIENT_SECRET``; a rotated refresh token replaces the current one."""
+        secret = (os.environ.get("LINEAJE_IDP_CLIENT_SECRET") or "").strip()
+        if not secret:
+            raise RuntimeError(f"LINEAJE_PAT_TOKEN is a Keycloak refresh token (client {self._keycloak_client!r}): "
+                               "exchanging it needs LINEAJE_IDP_CLIENT_SECRET, that client's secret")
+        form = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": self._refresh_token,
+                                       "client_id": self._keycloak_client, "client_secret": secret}).encode("utf-8")
+        req = urllib.request.Request(self._keycloak_url, data=form, method="POST",
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="replace")
+            raise RuntimeError(f"Keycloak refresh_token grant HTTP {exc.code}: {body[:500]}") from exc
+        token = str(data.get("access_token") or "").strip() if isinstance(data, dict) else ""
+        if not token:
+            raise RuntimeError("Keycloak refresh_token grant returned no access_token")
+        rotated = str(data.get("refresh_token") or "").strip()
+        if rotated:
+            self._refresh_token = rotated
+        try:
+            ttl = int(data.get("expires_in") or 300)
+        except (TypeError, ValueError):
+            ttl = 300
+        self._access_token = token
+        self._access_deadline = time.time() + max(60, ttl)
+        logger.debug("Access token from Keycloak (%s); expires in %ds", self._keycloak_client, ttl)
+
+
 def build_bearer_getter() -> Callable[[], str]:
     pat = _normalize_token(os.environ.get("LINEAJE_PAT_TOKEN", ""))
     if not pat:
         raise RuntimeError("LINEAJE_PAT_TOKEN is not set")
     mgr = RefreshTokenTokenManager(pat)
-    return mgr.get_access_token
+
+    def _get() -> str:
+        return mgr.get_access_token()
+
+    # The instrumentation PR's .env.example carries a refresh token issued here.
+    _get.issue_refresh_token = mgr.issue_refresh_token  # type: ignore[attr-defined]
+    return _get
 
 # ===========================================================================
 # File collection
@@ -993,8 +1189,39 @@ def _parse_tool_result(result: Any) -> dict:
             return structured
     if hasattr(result, "content") and result.content:
         raw = result.content[0].text if hasattr(result.content[0], "text") else str(result.content[0])
+        if getattr(result, "isError", False):
+            return {"error": (raw or "").strip() or "MCP tool returned an error", "raw": raw}
         return _loads_scan_payload(raw)
+    if getattr(result, "isError", False):
+        return {"error": "MCP tool returned an error", "raw": ""}
     return {"raw": "empty response"}
+
+
+# adapter.generate_error_report: plain markdown, no JSON (every early exit of
+# analyze_uploaded_archive — auth, tenant, SCIM/SCM config, project, analysis).
+_ERROR_REPORT_LINE = re.compile(r"^\*\*Error\*\*:\s*(.+)$", re.MULTILINE)
+
+
+def _mcp_result_error(result: Dict[str, Any]) -> str:
+    """Error message for a failed analyze reply, "" for a usable one.
+
+    A reply that is not a scan result (MCP error flag, empty, non-JSON, or the
+    server's error-report text) must fail the batch — never count as 0 findings.
+    """
+    err = str(result.get("error") or "").strip()
+    if err:
+        return err
+    if result.get("success") is False:
+        return f"analyze_uploaded_archive failed: {result}"
+    if "status" in result or set(result) - {"raw", "report"}:
+        return ""  # parsed JSON (status missing on older servers is tolerated)
+    raw = str(result.get("raw") or "").strip()
+    if not raw or raw == "empty response":
+        return "empty response from analyze_uploaded_archive"
+    m = _ERROR_REPORT_LINE.search(raw)
+    if m and "## Error" in raw:
+        return m.group(1).strip()
+    return f"analyze_uploaded_archive returned a non-JSON reply: {raw[:300]}"
 
 
 def _describe_exception(exc: BaseException) -> str:
@@ -1051,6 +1278,21 @@ def _module_prefix_insert_index(lines: List[str]) -> int:
     except SyntaxError:
         pass
     return idx
+
+
+def insert_go_helper(lines: List[str], block: str) -> None:
+    """Place a Go helper block (same as insertion_point_scanner.insert_go_helper): its
+    ``import (...)`` line right after the ``package`` clause, the functions at the end of
+    the file. One spot for both does not compile."""
+    imports = [l for l in block.splitlines(keepends=True) if l.startswith("import ")]
+    body = "".join(l for l in block.splitlines(keepends=True) if not l.startswith("import "))
+    pkg = next((i for i, l in enumerate(lines) if l.startswith("package ")), -1)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    if body.strip():
+        lines.append("\n" + body.rstrip("\n") + "\n")
+    for imp in reversed(imports):
+        lines.insert(pkg + 1, imp if imp.endswith("\n") else imp + "\n")
 
 
 def safe_prefix_insert_index(lines: List[str]) -> int:
@@ -1160,7 +1402,9 @@ _JS_GUARD_SPEC_RE = re.compile(
     r"""(?P<how>\bfrom\s*|\brequire\s*\(\s*)['"]\./unifaiGuard(?P<ext>\.[cm]?js)?['"]""")
 _JS_GUARD_EXPORTS = ("UNIFAI_GUARD_MANIFEST", "VERSION", "findPromptAttacks", "sanitizePrompt",
                      "sanitizeMessages", "unsupportedPiiCategories", "redactPii", "maskPii", "findCodeExecution",
-                     "removeSuspiciousContent", "findShellCommands")
+                     "removeSuspiciousContent", "findShellCommands", "removeHiddenPrompts", "findHiddenPrompts",
+                     "removeEncodedPrompts", "findEncodedPrompts", "removeLeetspeakPrompts", "findLeetspeakPrompts",
+                     "findCommandRequests")
 
 
 def _js_guard_commonjs(source: str) -> str:
@@ -1251,9 +1495,26 @@ only; Python 3.8+.
   a chat message list (string content and text parts).
 * ``remove_suspicious_content(text)``: uploaded or fetched file content with shell
   commands (alias, rg/ripgrep, curl, wget, rm, echo > file, dd, git, tar, chmod, chown,
-  fsck, mkfs, shred, eval, source, export), also when base64-encoded or written in
-  leetspeak, replaced by ``<suspicious_content_removed>``; ``find_shell_commands(text)``
-  lists them.
+  fsck, mkfs, mkswap, shred, eval, source, export, exec, sed -i, mv; a download piped
+  into a shell as a whole), also when base64-encoded or written in leetspeak, replaced
+  by ``<suspicious_content_removed>``; ``find_shell_commands(text)`` lists them.
+* ``remove_hidden_prompts(text)`` (AI_APP_SEC_001): instructions hidden in HTML
+  comments, invisible elements (hidden, display:none, opacity:0, font-size:0, white
+  text, off-screen, sr-only), zero-width, bidi or Unicode tag characters, replaced by
+  ``<hidden_prompts_removed>``; ``find_hidden_prompts(text)`` lists them.
+* ``remove_encoded_prompts(text)`` (AI_APP_SEC_002): instructions encoded as base64
+  (standard or URL-safe, padded or not, also split over concatenated strings), hex,
+  percent-encoding or ROT13, up to two layers, replaced by
+  ``<encoded_prompts_removed>``; ``find_encoded_prompts(text)`` lists them decoded.
+* ``remove_leetspeak_prompts(text)`` (AI_APP_SEC_032): instructions written in
+  leetspeak (1gn0r3, !gn0r3, |gn0r3) or spaced letters, replaced by
+  ``<leetspeak_prompts_removed>``; ``find_leetspeak_prompts(text)`` lists them.
+* ``find_command_requests(value)`` (AI_APP_SEC_059): the kinds of command-execution
+  request in a prompt (str, chat messages, dict or pydantic model), also hidden,
+  encoded or in leetspeak; the caller refuses the request (HTTP 400) and logs a
+  fingerprint of it, never the text.
+* The remove_* functions accept str, list, dict, pydantic model or dataclass and return
+  the same type.
 * ``find_code_execution(text)``: the dynamic code-execution primitives found in
   model output (eval, exec, os.system, subprocess with shell=True, JS eval /
   Function / child_process, shell eval, piping a download into a shell), for code
@@ -1268,8 +1529,10 @@ import re
 
 __all__ = ["sanitize_prompt", "find_prompt_attacks", "redact_pii", "mask_pii", "sanitize_messages",
            "unsupported_pii_categories", "find_code_execution", "remove_suspicious_content",
-           "find_shell_commands"]
-__version__ = "2.4.0"
+           "find_shell_commands", "remove_hidden_prompts", "find_hidden_prompts",
+           "remove_encoded_prompts", "find_encoded_prompts", "remove_leetspeak_prompts",
+           "find_leetspeak_prompts", "find_command_requests"]
+__version__ = "2.5.0"
 
 # UNIFAI-GUARD owner="Lineaje UnifAI": generated by UnifAI remediation scans; do not edit.
 # Scans read UNIFAI_GUARD_MANIFEST (without running this file) to reuse this module instead
@@ -1277,13 +1540,18 @@ __version__ = "2.4.0"
 # policy needs one listed nowhere below. Keys are the policies' runtime.routine.id values.
 UNIFAI_GUARD_MANIFEST = {
     "owner": "Lineaje UnifAI",
-    "version": "2.4.0",
+    "version": "2.5.0",
     "routines": {
         "sanitize_prompt_injection": ["sanitize_prompt", "find_prompt_attacks", "sanitize_messages",
                                       "remove_suspicious_content", "find_shell_commands"],
         "mask_pii": ["redact_pii", "mask_pii"],
         "mask_pii_and_secrets": ["redact_pii", "mask_pii"],
         "validate_llm_output": ["find_code_execution"],
+        "remove_hidden_prompts": ["remove_hidden_prompts", "find_hidden_prompts"],
+        "remove_encoded_prompts": ["remove_encoded_prompts", "find_encoded_prompts"],
+        "remove_leetspeak_prompts": ["remove_leetspeak_prompts", "find_leetspeak_prompts"],
+        "remove_suspicious_content": ["remove_suspicious_content", "find_shell_commands"],
+        "reject_command_requests": ["find_command_requests"],
     },
 }
 
@@ -1646,6 +1914,11 @@ _CODE_EXECUTION = (
     ("shell_eval", re.compile(r"(?:^|[;&|\s])(?:eval|source)\s+['\"$]|\b(?:bash|sh|zsh)\s+-c\s+\S", re.M)),
     ("pipe_to_shell", re.compile(r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b")),
     ("destructive_command", re.compile(r"\brm\s+-rf\s+/|\bmkfs(?:\.\w+)?\s|\bdd\s+if=|:\(\)\s*\{\s*:\|:&\s*\};:")),
+    ("dynamic_lookup", re.compile(r"\bgetattr\s*\(\s*(?:__builtins__|builtins|globals\s*\(\s*\)|os)\s*,"
+                                  r"|[\"'](?:ev|ex|sys|po)[\"']\s*\+\s*[\"'](?:al|ec|tem|pen)[\"']")),
+    ("js_string_timer", re.compile(r"\bset(?:Timeout|Interval|Immediate)\s*\(\s*['\"`]")),
+    ("unsafe_deserialization", re.compile(r"\b(?:pickle|cPickle|_pickle|dill|marshal|shelve|jsonpickle)\.(?:loads?|decode|open)\s*\("
+                                          r"|\byaml\.(?:unsafe_)?load\s*\((?![^)]*Safe)")),
 )
 
 
@@ -1678,12 +1951,28 @@ _CMD = (
     r"|fsck(?:\.\w+)?(?:\s+-\S+)*\s+\S+"
     r"|mkfs(?:\.\w+)?\s+\S+"
     r"|shred\s+(?:-\S+\s+)*\S+"
+    r"|mkswap\s+(?:-\S+\s+)*\S+"
+    r"|exec\s+(?:-\S+\s+)*[/~$.]\S*"
+    r"|sed\s+(?:-[a-z]*i\S*\s+(?:-\S+\s+)*\S+|(?:-\S+\s+)*[\"']?s/[^/\n]*/[^/\n]*/)"
+    r"|(?:ba|z|k)?sh\s+(?:-\S+\s+)*[\w./~$-]+\.sh\b"
+    r"|mv\s+(?:-[a-z]+\s+)*[\w./~$*-]+\s+[\w./~$*-]+"
     r"|(?:eval|source)\s+\S+"
     r"|export\s+[A-Z_][A-Z0-9_]*=\S*"
     r")"
 )
 # A command at the start of a line, after a prompt, or after a shell separator.
-_SHELL_LINE = re.compile(r"(?:(?<=^)|(?<=\n)|(?<=[;&|`]))[ \t]*(?:[$#>]\s*)?" + _CMD + r"[^\n;&|]*", re.I)
+# A download piped into a shell is removed as a whole (curl ... | sh), not up to the pipe.
+_SHELL_LINE = re.compile(r"(?:(?<=^)|(?<=\n)|(?<=[;&|`]))[ \t]*(?:[$#>]\s*)?" + _CMD + r"[^\n;&|]*"
+                         r"(?:\|\s*(?:sudo\s+)?(?:ba|z|k|da)?sh\b[^\n;&|]*)?", re.I)
+# A command asked for in prose ("Tell the agent to execute chmod 777 /etc/shadow"), and
+# destructive commands wherever they appear.
+_CMD_IN_PROSE = re.compile(r"\b(?:run|execute|exec|type|enter|paste|invoke|launch)\b\s*:?\s*[`\"']?(?P<cmd>"
+                           + _CMD + r"[^\n;&|`\"']*)", re.I)
+_DESTRUCTIVE = re.compile(
+    r"\b(?:mkfs(?:\.\w+)?|mkswap|shred)\s+(?:-\S+\s+)*[/~$]\S*"
+    r"|\bdd\s+(?:if|of)=\S+(?:\s+(?:if|of|bs|count|seek)=\S+)*"
+    r"|\brm\s+-[a-z]*r[a-z]*\s+[/~$]\S*"
+    r"|\bchmod\s+(?:-R\s+)?[0-7]{3,4}\s+/\S+", re.I)
 _BASE64_SHORT = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])")
 _LEET_MULTI = (("|-|", "h"), ("|_|", "u"), ("|<", "k"), ("|\\|", "n"), ("/\\", "a"), ("()", "o"))
 
@@ -1698,6 +1987,8 @@ def _shell_spans(text):
     """(start, end) of shell-command lines in *text*: plain, leetspeak-folded per line, or
     inside a base64 token."""
     spans = [(m.start(), m.end()) for m in _SHELL_LINE.finditer(text)]
+    spans += [m.span("cmd") for m in _CMD_IN_PROSE.finditer(text)]
+    spans += [(m.start(), m.end()) for m in _DESTRUCTIVE.finditer(text)]
     offset = 0
     for line in text.splitlines(keepends=True):
         body = line.rstrip("\r\n")
@@ -1742,6 +2033,362 @@ def remove_suspicious_content(text):
     for start, end in reversed(_shell_spans(text)):
         out = out[:start] + "<suspicious_content_removed>" + out[end:]
     return out
+
+
+# --- hidden, encoded and leetspeak prompts; command requests ------------------------
+# (AI_APP_SEC_001 / 002 / 032 / 059). One function per policy, so a fix for one policy
+# never changes what another policy's function does. sanitize_prompt (AI_APP_SEC_070)
+# keeps its own phrase list; the wider one below is used only by these functions.
+
+_INSTRUCTION = re.compile(
+    r"\b(?:ignore|disregard|forget|override|bypass)\s+"
+    r"(?:(?:all|any|every|the|your|my|these|those|of|previous|prior|above|earlier|preceding|"
+    r"original|existing|safety|system|security)\s+){0,4}"
+    r"(?:instructions?|rules|guidelines|guardrails|restrictions|polic(?:y|ies)|prompts?|filters?)\b"
+    r"|\byou\s+are\s+now\s+(?:in\s+)?(?:an?\s+)?(?:dan|unrestricted|unfiltered|jailbroken|evil|"
+    r"developer\s+mode|admin(?:istrator)?\s+mode|god\s+mode)\b"
+    r"|\b(?:reveal|print|show|dump|leak|send|output|exfiltrate|list)\s+(?:me\s+)?(?:all\s+|the\s+|your\s+|any\s+)*"
+    r"(?:system\s+prompts?|hidden\s+instructions|secrets?|(?:user\s+)?passwords?|api[\s_-]?keys?|credentials|"
+    r"access\s+tokens?|private\s+keys?)\b"
+    r"|\bdo\s+anything\s+now\b", re.I)
+
+
+def _is_instruction(text):
+    """*text* (already decoded / made visible) asks the model to override its rules, leak
+    secrets or run a command."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_INSTRUCTION.search(text) or _phrase_spans(text) or _SHELL.search(text)
+                or _SHELL_LINE.search(text.strip()) or _command_request_spans(text))
+
+
+def _replace_spans(text, spans, marker):
+    spans = sorted(spans)
+    merged = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    out = text
+    for start, end in reversed(merged):
+        out = out[:start] + marker + out[end:]
+    return out
+
+
+# Hidden: invisible characters, Unicode tag characters, bidi overrides, HTML comments and
+# elements styled to be invisible (hidden, display:none, visibility:hidden, opacity:0,
+# font-size:0/1, white text, off-screen, sr-only).
+_INVISIBLE_CHARS = "\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff\u00ad\u180e" \
+                   "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+_INVISIBLE_RE = re.compile("[" + _INVISIBLE_CHARS + "]")
+_TAG_RUN = re.compile("[\U000e0000-\U000e007f]+")
+_HIDDEN_ELEMENT = re.compile(
+    r"<(?P<tag>[a-z][a-z0-9]*)\b[^>]*?(?:\shidden\b|\saria-hidden\s*=\s*[\"']true[\"']"
+    r"|style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|visibility\s*:\s*hidden"
+    r"|font-size\s*:\s*[01](?:\.\d+)?(?:px|pt|em|rem)?(?=\s*[;\"'])"
+    r"|opacity\s*:\s*0(?:\.0+)?(?=\s*[;\"'])"
+    r"|(?<![\w-])color\s*:\s*(?:#fff(?:fff)?\b|white\b|rgba?\(\s*255\s*,\s*255\s*,\s*255)"
+    r"|(?:left|top|text-indent)\s*:\s*-\d{3,})[^\"']*[\"']"
+    r"|class\s*=\s*[\"'][^\"']*\b(?:hidden|invisible|sr-only|visually-hidden|d-none)\b[^\"']*[\"'])[^>]*>"
+    r"(?P<body>.*?)</(?P=tag)\s*>", re.I | re.S)
+_TAGS = re.compile(r"<[^>]+>")
+
+
+def _visible(text):
+    """(text without invisible characters, index map back into *text*)."""
+    chars, index = [], []
+    for i, ch in enumerate(text):
+        if ch not in _INVISIBLE_CHARS and not 0xE0000 <= ord(ch) <= 0xE007F:
+            chars.append(ch)
+            index.append(i)
+    return "".join(chars), index
+
+
+def _hidden_spans(text):
+    spans = []
+    start = text.find("<!--")
+    while start != -1:
+        end = text.find("-->", start + 4)
+        if end == -1:
+            break
+        body = text[start + 4:end]
+        if _is_instruction(_visible(body)[0]):
+            spans.append((start, end + 3, body.strip()))
+        start = text.find("<!--", end + 3)
+    for m in _HIDDEN_ELEMENT.finditer(text):
+        body = _visible(_TAGS.sub(" ", m.group("body")))[0]
+        if _is_instruction(body):
+            spans.append((m.start(), m.end(), body.strip()))
+    for m in _TAG_RUN.finditer(text):
+        decoded = "".join(chr(ord(ch) - 0xE0000) for ch in m.group(0) if 0xE0020 <= ord(ch) <= 0xE007E)
+        if _is_instruction(decoded):
+            spans.append((m.start(), m.end(), decoded))
+    if _INVISIBLE_RE.search(text):
+        visible, index = _visible(text)
+        for start, end in _instruction_spans(visible):
+            o_start, o_end = index[start], index[end - 1] + 1
+            if _INVISIBLE_RE.search(text, o_start, o_end):
+                spans.append((o_start, o_end, visible[start:end]))
+    return spans
+
+
+def _instruction_spans(text):
+    spans = [(m.start(), m.end()) for m in _INSTRUCTION.finditer(text)]
+    spans += [(s, e) for s, e, _c in _phrase_spans(text)]
+    spans += [(m.start(), m.end()) for m in _SHELL.finditer(text)]
+    return spans
+
+
+def find_hidden_prompts(text):
+    """The instructions hidden in *text* (HTML comments, invisible elements, zero-width or
+    Unicode tag characters), made readable; empty list: none."""
+    if not isinstance(text, str) or not text:
+        return []
+    return [found for _s, _e, found in sorted(_hidden_spans(text))]
+
+
+def remove_hidden_prompts(text):
+    """*text* with each hidden instruction replaced by ``<hidden_prompts_removed>``; visible
+    text, and hidden content that is not an instruction, are kept. Accepts str, list,
+    dict, pydantic model or dataclass and returns the same type."""
+    if not isinstance(text, str):
+        return _structured(text, remove_hidden_prompts) if text is not None else text
+    spans = _hidden_spans(text)
+    if not spans:
+        return text
+    return _replace_spans(text, [(s, e) for s, e, _f in spans], "<hidden_prompts_removed>")
+
+
+# Encoded: base64 (standard or URL-safe, padded or not), hex, percent-encoding and ROT13,
+# up to two layers; a span is removed only when its decoded text is an instruction.
+_B64_TOKEN = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/=_-])")
+_HEX_TOKEN = re.compile(r"(?<![0-9A-Fa-f])(?:\\x)?(?:[0-9A-Fa-f]{2}(?:\\x)?){8,}(?![0-9A-Fa-f])")
+_PCT_TOKEN = re.compile(r"(?<![^\s\"'<>])[^\s\"'<>%]*%[0-9A-Fa-f]{2}[^\s\"'<>]*")
+_JOINED_STRINGS = re.compile(r"[\"']\s*\+\s*[\"']")
+_ROT13 = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+                       "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm")
+
+
+def _printable(decoded):
+    return decoded and sum(ch.isprintable() or ch.isspace() for ch in decoded) >= 0.95 * len(decoded)
+
+
+def _decode_token(token):
+    """Readable text *token* decodes to (base64 / hex / percent), else None."""
+    import urllib.parse
+    raw = token.replace("\\x", "")
+    if "%" in token:
+        if len(re.findall(r"%[0-9A-Fa-f]{2}", token)) < 4:
+            return None
+        decoded = urllib.parse.unquote(token)
+        return decoded if decoded != token and _printable(decoded) else None
+    if re.fullmatch(r"(?:[0-9A-Fa-f]{2}){8,}", raw):
+        try:
+            decoded = bytes.fromhex(raw).decode("utf-8")
+            if _printable(decoded):
+                return decoded
+        except (ValueError, UnicodeDecodeError):
+            pass
+    body = token.rstrip("=").replace("-", "+").replace("_", "/")
+    if len(body) % 4 == 1:
+        return None
+    try:
+        decoded = base64.b64decode(body + "=" * (-len(body) % 4), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    return decoded if _printable(decoded) else None
+
+
+def _decoded_instruction(decoded, depth=1):
+    if _is_instruction(decoded):
+        return decoded
+    if depth < 2:
+        for rx in (_B64_TOKEN, _HEX_TOKEN, _PCT_TOKEN):
+            for m in rx.finditer(decoded):
+                inner = _decode_token(m.group(0))
+                if inner and _decoded_instruction(inner, depth + 1):
+                    return inner
+    return None
+
+
+def _encoded_spans_wide(text):
+    spans, pieces = [], []
+    for rx in (_B64_TOKEN, _HEX_TOKEN, _PCT_TOKEN):
+        for m in rx.finditer(text):
+            decoded = _decode_token(m.group(0))
+            if decoded is None:
+                continue
+            pieces.append((m.start(), m.end(), decoded))
+            found = _decoded_instruction(decoded)
+            if found:
+                spans.append((m.start(), m.end(), found))
+    # A payload split over concatenated string literals ("SWdu..." + "aW5z...").
+    pieces.sort()
+    for i in range(len(pieces) - 1):
+        a, b = pieces[i], pieces[i + 1]
+        if _JOINED_STRINGS.fullmatch(text[a[1]:b[0]].strip()) or not text[a[1]:b[0]].strip():
+            joined = a[2] + b[2]
+            if _is_instruction(joined) and not (_is_instruction(a[2]) and _is_instruction(b[2])):
+                spans.append((a[0], b[1], joined))
+    for line_start, line in _lines_with_offsets(text):
+        rotated = line.translate(_ROT13)
+        for start, end in _instruction_spans(rotated):
+            if not _instruction_spans(line[start:end]):
+                spans.append((line_start + start, line_start + end, rotated[start:end]))
+    return spans
+
+
+def _lines_with_offsets(text):
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        yield offset, line.rstrip("\r\n")
+        offset += len(line)
+
+
+def find_encoded_prompts(text):
+    """The decoded instructions found in *text* (empty list: none)."""
+    if not isinstance(text, str) or not text:
+        return []
+    return [found for _s, _e, found in sorted(_encoded_spans_wide(text))]
+
+
+def remove_encoded_prompts(text):
+    """*text* with each encoded instruction (base64, URL-safe base64, hex, percent, ROT13)
+    replaced by ``<encoded_prompts_removed>``; encoded data that is not an instruction is
+    kept. Accepts str, list, dict, pydantic model or dataclass and returns the same type."""
+    if not isinstance(text, str):
+        return _structured(text, remove_encoded_prompts) if text is not None else text
+    spans = _encoded_spans_wide(text)
+    if not spans:
+        return text
+    return _replace_spans(text, [(s, e) for s, e, _f in spans], "<encoded_prompts_removed>")
+
+
+# Leetspeak: each letter also matches its usual substitutes (1 ! | for i and l, 3 for e,
+# 0 for o, 4 @ for a, 5 $ for s, 7 + for t ...); letters may be spaced out, with a wider
+# gap between words. A match of this wider list counts only if it uses a substitute or
+# spaced letters; the plain phrases sanitize_prompt removes are removed too.
+_LEET_LETTERS = {"a": "a4@", "b": "b8", "e": "e3", "g": "g96", "i": "i1!|l", "l": "l1|i",
+                 "o": "o0", "s": "s5$", "t": "t7+", "z": "z2"}
+
+
+def _leet_word(word):
+    return r" ?".join("[" + re.escape(_LEET_LETTERS.get(ch, ch)) + "]" for ch in word)
+
+
+def _leet_any(words):
+    return "(?:" + "|".join(_leet_word(w) for w in sorted(words, key=len, reverse=True)) + ")"
+
+
+_GAP = r"\s+"
+_LEET_PROMPT = re.compile(
+    _leet_any(("ignore", "disregard", "forget", "override", "bypass")) + _GAP
+    + "(?:" + _leet_any(("all", "any", "the", "your", "my", "previous", "prior", "above", "earlier",
+                         "safety", "system", "original")) + _GAP + "){0,3}"
+    + _leet_any(("instructions", "instruction", "rules", "guidelines", "restrictions", "prompt",
+                 "prompts", "filters", "policies", "policy"))
+    + "|" + _leet_any(("you",)) + _GAP + _leet_any(("are",)) + _GAP + _leet_any(("now",)) + _GAP
+    + "(?:" + _leet_any(("in", "an", "a")) + _GAP + ")?"
+    + _leet_any(("dan", "unrestricted", "unfiltered", "jailbroken", "evil", "developer", "admin", "god"))
+    + "|" + _leet_any(("reveal", "print", "show", "dump", "leak", "send")) + _GAP
+    + "(?:" + _leet_any(("the", "your", "all", "me")) + _GAP + "){0,2}"
+    + _leet_any(("system", "secrets", "secret", "passwords", "password", "credentials", "api"))
+    + "(?:" + _GAP + _leet_any(("prompt", "keys", "key")) + ")?",
+    re.I)
+_LEET_MARK = re.compile(r"[0-9@$!|+]|(?<![^\W\d_])[^\W\d_] [^\W\d_] [^\W\d_](?![^\W\d_])")
+
+
+def _leetspeak_spans(text):
+    spans = [(start, end, text[start:end]) for start, end, _c in _phrase_spans(text)]
+    for line_start, line in _lines_with_offsets(text):
+        for m in _LEET_PROMPT.finditer(line):
+            if _LEET_MARK.search(m.group(0)):
+                # The rest of the line belongs to the same instruction ("... 4nd r3v34l ...").
+                spans.append((line_start + m.start(), line_start + len(line.rstrip()), m.group(0)))
+        folded = _fold_leet(line)
+        if folded != line and _SHELL_LINE.search(folded) and not _SHELL_LINE.search(line):
+            lead = len(line) - len(line.lstrip())
+            spans.append((line_start + lead, line_start + len(line.rstrip()), folded.strip()))
+    return spans
+
+
+def find_leetspeak_prompts(text):
+    """The leetspeak or letter-spaced instructions found in *text* (empty list: none)."""
+    if not isinstance(text, str) or not text:
+        return []
+    return [text[s:e] for s, e, _f in sorted(_leetspeak_spans(text))]
+
+
+def remove_leetspeak_prompts(text):
+    """*text* with each leetspeak or letter-spaced instruction replaced by
+    ``<leetspeak_prompts_removed>`` (also the plain phrases sanitize_prompt removes);
+    ordinary text with digits is kept. Accepts str, list,
+    dict, pydantic model or dataclass and returns the same type."""
+    if not isinstance(text, str):
+        return _structured(text, remove_leetspeak_prompts) if text is not None else text
+    spans = _leetspeak_spans(text)
+    if not spans:
+        return text
+    return _replace_spans(text, [(s, e) for s, e, _f in spans], "<leetspeak_prompts_removed>")
+
+
+# Command requests (AI_APP_SEC_059): a request to run a shell command or code with a
+# target. A word or file name on its own (exec, bash, setup.sh) or a question about one
+# is not a request.
+_RUN_VERB = r"\b(?:run|execute|exec|eval|evaluate|launch)\b\s*:?\s*[`\"']?"
+_COMMAND_REQUEST = (
+    ("shell_command", re.compile(_RUN_VERB + _CMD, re.I)),
+    ("shell_command", re.compile(_RUN_VERB + r"(?:sudo\s+)?(?:bash|sh|zsh|ksh|python3?|node|perl|ruby|php|"
+                                 r"powershell|pwsh|cmd)\s+(?:-\w+\s+)?\S", re.I)),
+    ("code_execution", re.compile(_RUN_VERB + r"[\w.]+\([^)\n]*\)")),
+    ("secret_access", re.compile(
+        r"\b(?:cat|type|print|echo|read|dump|show|send)\b[^\n]{0,40}"
+        r"(?:/etc/(?:passwd|shadow)|os\.environ|process\.env|\.ssh/|\.aws/credentials|\$[A-Z_]*(?:KEY|TOKEN|SECRET))",
+        re.I)),
+)
+
+
+def _command_request_spans(text):
+    spans = []
+    for category, pattern in _COMMAND_REQUEST:
+        spans.extend((m.start(), m.end(), category) for m in pattern.finditer(text))
+    return spans
+
+
+def _command_findings(text):
+    found = {category for _s, _e, category in _command_request_spans(text)}
+    if _SHELL.search(text):
+        found.add("shell_command")
+    for name in find_code_execution(text):
+        found.add("pipe_to_shell" if name == "pipe_to_shell" else "code_execution")
+    return found
+
+
+def _strings(value, out, depth=0):
+    if isinstance(value, str):
+        out.append(value)
+    elif depth <= 8 and value is not None:
+        _structured(value, lambda s: out.append(s) or s, depth)
+    return out
+
+
+def find_command_requests(text):
+    """The kinds of command-execution request in *text* (empty list: none): shell
+    commands, code execution, piping a download into a shell, reading secrets; also when
+    the request is hidden, encoded or written in leetspeak. Accepts str, a list of chat
+    messages, dict or pydantic model. The caller refuses the request (HTTP 400) and logs
+    a fingerprint of it, never the text."""
+    found = set()
+    for piece in _strings(text, []):
+        if not piece:
+            continue
+        variants = [piece, _visible(piece)[0], _fold_leet(piece)]
+        variants += [f for _s, _e, f in _hidden_spans(piece)]
+        variants += [f for _s, _e, f in _encoded_spans_wide(piece)]
+        for variant in variants:
+            found |= _command_findings(variant)
+    return sorted(found)
 '''
 _UNIFAI_GUARD_JS_SOURCE = r'''/*
  * Prompt-injection and PII guard added by Lineaje UnifAI remediation.
@@ -1767,7 +2414,22 @@ _UNIFAI_GUARD_JS_SOURCE = r'''/*
  *   message list (string content and text parts).
  * - findCodeExecution(text): the dynamic code-execution primitives found in model
  *   output (eval, exec, os.system, subprocess with shell=True, JS eval / Function /
- *   child_process, shell eval, piping a download into a shell).
+ *   child_process, shell eval, piping a download into a shell, string timers, unsafe
+ *   deserialization).
+ * - removeSuspiciousContent(text): uploaded or fetched file content with shell commands
+ *   replaced by <suspicious_content_removed>; findShellCommands(text) lists them.
+ * - removeHiddenPrompts(text) (AI_APP_SEC_001): instructions hidden in HTML comments,
+ *   invisible elements, zero-width, bidi or Unicode tag characters, replaced by
+ *   <hidden_prompts_removed>; findHiddenPrompts(text) lists them.
+ * - removeEncodedPrompts(text) (AI_APP_SEC_002): instructions encoded as base64
+ *   (standard or URL-safe, padded or not, also split over concatenated strings), hex,
+ *   percent-encoding or ROT13, replaced by <encoded_prompts_removed>;
+ *   findEncodedPrompts(text) lists them decoded.
+ * - removeLeetspeakPrompts(text) (AI_APP_SEC_032): instructions in leetspeak or spaced
+ *   letters, replaced by <leetspeak_prompts_removed>; findLeetspeakPrompts(text).
+ * - findCommandRequests(value) (AI_APP_SEC_059): the kinds of command-execution request
+ *   in a prompt (string, chat messages or object); the caller refuses it (HTTP 400).
+ * The remove* functions accept strings, arrays and objects and return the same shape.
  *
  * Never apply these to identifiers or lookup keys (user ids, file names,
  * document ids): those must reach their service unchanged.
@@ -1779,17 +2441,22 @@ _UNIFAI_GUARD_JS_SOURCE = r'''/*
 // policy needs one listed nowhere below. Keys are the policies' runtime.routine.id values.
 export const UNIFAI_GUARD_MANIFEST = {
   "owner": "Lineaje UnifAI",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "routines": {
     "sanitize_prompt_injection": ["sanitizePrompt", "findPromptAttacks", "sanitizeMessages",
                                   "removeSuspiciousContent", "findShellCommands"],
     "mask_pii": ["redactPii", "maskPii"],
     "mask_pii_and_secrets": ["redactPii", "maskPii"],
-    "validate_llm_output": ["findCodeExecution"]
+    "validate_llm_output": ["findCodeExecution"],
+    "remove_hidden_prompts": ["removeHiddenPrompts", "findHiddenPrompts"],
+    "remove_encoded_prompts": ["removeEncodedPrompts", "findEncodedPrompts"],
+    "remove_leetspeak_prompts": ["removeLeetspeakPrompts", "findLeetspeakPrompts"],
+    "remove_suspicious_content": ["removeSuspiciousContent", "findShellCommands"],
+    "reject_command_requests": ["findCommandRequests"]
   }
 };
 
-export const VERSION = "2.4.0";
+export const VERSION = "2.5.0";
 
 // --- prompt injection -------------------------------------------------------
 
@@ -2208,7 +2875,10 @@ const CODE_EXECUTION = [
   ["js_child_process", /\b(?:child_process\.)?(?:exec|execSync|spawn|spawnSync)\s*\(\s*['"`]/],
   ["shell_eval", /(?:^|[;&|\s])(?:eval|source)\s+['"$]|\b(?:bash|sh|zsh)\s+-c\s+\S/m],
   ["pipe_to_shell", /\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b/],
-  ["destructive_command", /\brm\s+-rf\s+\/|\bmkfs(?:\.\w+)?\s|\bdd\s+if=|:\(\)\s*\{\s*:\|:&\s*\};:/]
+  ["destructive_command", /\brm\s+-rf\s+\/|\bmkfs(?:\.\w+)?\s|\bdd\s+if=|:\(\)\s*\{\s*:\|:&\s*\};:/],
+  ["dynamic_lookup", /\bgetattr\s*\(\s*(?:__builtins__|builtins|globals\s*\(\s*\)|os)\s*,|["'](?:ev|ex|sys|po)["']\s*\+\s*["'](?:al|ec|tem|pen)["']/],
+  ["js_string_timer", /\bset(?:Timeout|Interval|Immediate)\s*\(\s*['"`]/],
+  ["unsafe_deserialization", /\b(?:pickle|cPickle|_pickle|dill|marshal|shelve|jsonpickle)\.(?:loads?|decode|open)\s*\(|\byaml\.(?:unsafe_)?load\s*\((?![^)]*Safe)/]
 ];
 
 /**
@@ -2238,10 +2908,26 @@ const CMD = "(?:sudo\\s+)?(?:"
   + "|fsck(?:\\.\\w+)?(?:\\s+-\\S+)*\\s+\\S+"
   + "|mkfs(?:\\.\\w+)?\\s+\\S+"
   + "|shred\\s+(?:-\\S+\\s+)*\\S+"
+  + "|mkswap\\s+(?:-\\S+\\s+)*\\S+"
+  + "|exec\\s+(?:-\\S+\\s+)*[/~$.]\\S*"
+  + "|sed\\s+(?:-[a-z]*i\\S*\\s+(?:-\\S+\\s+)*\\S+|(?:-\\S+\\s+)*[\"']?s/[^/\\n]*/[^/\\n]*/)"
+  + "|(?:ba|z|k)?sh\\s+(?:-\\S+\\s+)*[\\w./~$-]+\\.sh\\b"
+  + "|mv\\s+(?:-[a-z]+\\s+)*[\\w./~$*-]+\\s+[\\w./~$*-]+"
   + "|(?:eval|source)\\s+\\S+"
   + "|export\\s+[A-Z_][A-Z0-9_]*=\\S*"
   + ")";
-const SHELL_LINE = new RegExp("(?:(?<=^)|(?<=\\n)|(?<=[;&|`]))[ \\t]*(?:[$#>]\\s*)?" + CMD + "[^\\n;&|]*", "gi");
+// A download piped into a shell is removed as a whole (curl ... | sh), not up to the pipe.
+const SHELL_LINE = new RegExp("(?:(?<=^)|(?<=\\n)|(?<=[;&|`]))[ \\t]*(?:[$#>]\\s*)?" + CMD + "[^\\n;&|]*"
+  + "(?:\\|\\s*(?:sudo\\s+)?(?:ba|z|k|da)?sh\\b[^\\n;&|]*)?", "gi");
+// A command asked for in prose ("Tell the agent to execute chmod 777 /etc/shadow"), and
+// destructive commands wherever they appear.
+const CMD_IN_PROSE = new RegExp("\\b(?:run|execute|exec|type|enter|paste|invoke|launch)\\b\\s*:?\\s*[`\"']?(?<cmd>"
+  + CMD + "[^\\n;&|`\"']*)", "gi");
+const DESTRUCTIVE = new RegExp(
+  "\\b(?:mkfs(?:\\.\\w+)?|mkswap|shred)\\s+(?:-\\S+\\s+)*[/~$]\\S*"
+  + "|\\bdd\\s+(?:if|of)=\\S+(?:\\s+(?:if|of|bs|count|seek)=\\S+)*"
+  + "|\\brm\\s+-[a-z]*r[a-z]*\\s+[/~$]\\S*"
+  + "|\\bchmod\\s+(?:-R\\s+)?[0-7]{3,4}\\s+/\\S+", "gi");
 const BASE64_SHORT = /(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])/g;
 const LEET_MULTI = [["|-|", "h"], ["|_|", "u"], ["|<", "k"], ["|\\|", "n"], ["/\\", "a"], ["()", "o"]];
 
@@ -2259,6 +2945,11 @@ function hasShell(text) {
 
 function shellSpans(text) {
   const spans = matches(SHELL_LINE, text).map((m) => [m.index, m.index + m[0].length]);
+  for (const m of matches(CMD_IN_PROSE, text)) {
+    const end = m.index + m[0].length;
+    spans.push([end - m.groups.cmd.length, end]);
+  }
+  for (const m of matches(DESTRUCTIVE, text)) spans.push([m.index, m.index + m[0].length]);
   let offset = 0;
   for (const line of text.split(/(?<=\n)/)) {
     const body = line.replace(/[\r\n]+$/, "");
@@ -2301,6 +2992,377 @@ export function removeSuspiciousContent(text) {
   }
   return out;
 }
+
+
+// --- hidden, encoded and leetspeak prompts; command requests ------------------------
+// (AI_APP_SEC_001 / 002 / 032 / 059). One function per policy, so a fix for one policy
+// never changes what another policy's function does. sanitizePrompt (AI_APP_SEC_070)
+// keeps its own phrase list; the wider one below is used only by these functions.
+
+const INSTRUCTION = new RegExp(
+  "\\b(?:ignore|disregard|forget|override|bypass)\\s+"
+  + "(?:(?:all|any|every|the|your|my|these|those|of|previous|prior|above|earlier|preceding|"
+  + "original|existing|safety|system|security)\\s+){0,4}"
+  + "(?:instructions?|rules|guidelines|guardrails|restrictions|polic(?:y|ies)|prompts?|filters?)\\b"
+  + "|\\byou\\s+are\\s+now\\s+(?:in\\s+)?(?:an?\\s+)?(?:dan|unrestricted|unfiltered|jailbroken|evil|"
+  + "developer\\s+mode|admin(?:istrator)?\\s+mode|god\\s+mode)\\b"
+  + "|\\b(?:reveal|print|show|dump|leak|send|output|exfiltrate|list)\\s+(?:me\\s+)?(?:all\\s+|the\\s+|your\\s+|any\\s+)*"
+  + "(?:system\\s+prompts?|hidden\\s+instructions|secrets?|(?:user\\s+)?passwords?|api[\\s_-]?keys?|credentials|"
+  + "access\\s+tokens?|private\\s+keys?)\\b"
+  + "|\\bdo\\s+anything\\s+now\\b", "gi");
+
+function spansOf(pattern, text) {
+  return matches(pattern, text).map((m) => [m.index, m.index + m[0].length]);
+}
+
+// text (already decoded / made visible) asks the model to override its rules, leak
+// secrets or run a command.
+function isInstruction(text) {
+  if (typeof text !== "string" || !text.trim()) return false;
+  return spansOf(INSTRUCTION, text).length > 0 || phraseSpans(text).length > 0
+    || matches(SHELL, text).length > 0 || hasShell(text.trim()) || commandRequestSpans(text).length > 0;
+}
+
+function replaceSpans(text, spans, marker) {
+  spans = spans.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged = [];
+  for (const [start, end] of spans) {
+    const prev = merged[merged.length - 1];
+    if (prev && start <= prev[1]) prev[1] = Math.max(prev[1], end);
+    else merged.push([start, end]);
+  }
+  let out = text;
+  for (let i = merged.length - 1; i >= 0; i--) {
+    out = out.slice(0, merged[i][0]) + marker + out.slice(merged[i][1]);
+  }
+  return out;
+}
+
+function linesWithOffsets(text) {
+  const out = [];
+  let offset = 0;
+  for (const line of text.split(/(?<=\n)/)) {
+    out.push([offset, line.replace(/[\r\n]+$/, "")]);
+    offset += line.length;
+  }
+  return out;
+}
+
+// Hidden: invisible characters, Unicode tag characters, bidi overrides, HTML comments and
+// elements styled to be invisible (hidden, display:none, visibility:hidden, opacity:0,
+// font-size:0/1, white text, off-screen, sr-only).
+const INVISIBLE_CHARS = "\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff\u00ad\u180e"
+  + "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069";
+const INVISIBLE_RE = new RegExp("[" + INVISIBLE_CHARS + "]");
+const TAG_RUN = /(?:\uDB40[\uDC00-\uDC7F])+/g;
+const HIDDEN_ELEMENT = new RegExp(
+  "<(?<tag>[a-z][a-z0-9]*)\\b[^>]*?(?:\\shidden\\b|\\saria-hidden\\s*=\\s*[\"']true[\"']"
+  + "|style\\s*=\\s*[\"'][^\"']*(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden"
+  + "|font-size\\s*:\\s*[01](?:\\.\\d+)?(?:px|pt|em|rem)?(?=\\s*[;\"'])"
+  + "|opacity\\s*:\\s*0(?:\\.0+)?(?=\\s*[;\"'])"
+  + "|(?<![\\w-])color\\s*:\\s*(?:#fff(?:fff)?\\b|white\\b|rgba?\\(\\s*255\\s*,\\s*255\\s*,\\s*255)"
+  + "|(?:left|top|text-indent)\\s*:\\s*-\\d{3,})[^\"']*[\"']"
+  + "|class\\s*=\\s*[\"'][^\"']*\\b(?:hidden|invisible|sr-only|visually-hidden|d-none)\\b[^\"']*[\"'])[^>]*>"
+  + "(?<body>[\\s\\S]*?)</\\k<tag>\\s*>", "gi");
+const TAGS = /<[^>]+>/g;
+
+// [text without invisible characters, index map back into text]
+function visible(text) {
+  const chars = [];
+  const index = [];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\uDB40" && i + 1 < text.length && text.charCodeAt(i + 1) >= 0xDC00 && text.charCodeAt(i + 1) <= 0xDC7F) {
+      i += 1;
+      continue;
+    }
+    if (INVISIBLE_CHARS.indexOf(ch) !== -1) continue;
+    chars.push(ch);
+    index.push(i);
+  }
+  return [chars.join(""), index];
+}
+
+function instructionSpans(text) {
+  return spansOf(INSTRUCTION, text)
+    .concat(phraseSpans(text).map((s) => [s[0], s[1]]))
+    .concat(spansOf(SHELL, text));
+}
+
+function hiddenSpans(text) {
+  const spans = [];
+  let start = text.indexOf("<!--");
+  while (start !== -1) {
+    const end = text.indexOf("-->", start + 4);
+    if (end === -1) break;
+    const body = text.slice(start + 4, end);
+    if (isInstruction(visible(body)[0])) spans.push([start, end + 3, body.trim()]);
+    start = text.indexOf("<!--", end + 3);
+  }
+  for (const m of matches(HIDDEN_ELEMENT, text)) {
+    const body = visible(m.groups.body.replace(TAGS, " "))[0];
+    if (isInstruction(body)) spans.push([m.index, m.index + m[0].length, body.trim()]);
+  }
+  for (const m of matches(TAG_RUN, text)) {
+    let decoded = "";
+    for (let i = 1; i < m[0].length; i += 2) {
+      const c = m[0].charCodeAt(i) - 0xDC00;
+      if (c >= 0x20 && c <= 0x7e) decoded += String.fromCharCode(c);
+    }
+    if (isInstruction(decoded)) spans.push([m.index, m.index + m[0].length, decoded]);
+  }
+  if (INVISIBLE_RE.test(text)) {
+    const [vis, index] = visible(text);
+    for (const [s, e] of instructionSpans(vis)) {
+      const oStart = index[s];
+      const oEnd = index[e - 1] + 1;
+      if (INVISIBLE_RE.test(text.slice(oStart, oEnd))) spans.push([oStart, oEnd, vis.slice(s, e)]);
+    }
+  }
+  return spans;
+}
+
+function bySpan(a, b) {
+  return a[0] - b[0] || a[1] - b[1];
+}
+
+/** The instructions hidden in text (HTML comments, invisible elements, zero-width or Unicode tag characters), made readable. */
+export function findHiddenPrompts(text) {
+  if (typeof text !== "string" || !text) return [];
+  return hiddenSpans(text).sort(bySpan).map((s) => s[2]);
+}
+
+/** text with each hidden instruction replaced by <hidden_prompts_removed>; same type in, same type out. */
+export function removeHiddenPrompts(text) {
+  if (typeof text !== "string") return structured(text, removeHiddenPrompts);
+  const spans = hiddenSpans(text);
+  return spans.length ? replaceSpans(text, spans, "<hidden_prompts_removed>") : text;
+}
+
+// Encoded: base64 (standard or URL-safe, padded or not), hex, percent-encoding and ROT13,
+// up to two layers; a span is removed only when its decoded text is an instruction.
+const B64_TOKEN = /(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/=_-])/g;
+const HEX_TOKEN = /(?<![0-9A-Fa-f])(?:\\x)?(?:[0-9A-Fa-f]{2}(?:\\x)?){8,}(?![0-9A-Fa-f])/g;
+const PCT_TOKEN = /(?<![^\s"'<>])[^\s"'<>%]*%[0-9A-Fa-f]{2}[^\s"'<>]*/g;
+const JOINED_STRINGS = /^["']\s*\+\s*["']$/;
+
+function rot13(text) {
+  return text.replace(/[A-Za-z]/g, (c) => {
+    const base = c <= "Z" ? 65 : 97;
+    return String.fromCharCode((c.charCodeAt(0) - base + 13) % 26 + base);
+  });
+}
+
+function printable(decoded) {
+  if (!decoded) return false;
+  const chars = Array.from(decoded);
+  return chars.filter(isPrintableOrSpace).length >= 0.95 * chars.length;
+}
+
+function utf8(bytes) {
+  try {
+    if (typeof TextDecoder === "undefined") return null;
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (e) {
+    return null;
+  }
+}
+
+// Readable text token decodes to (base64 / hex / percent), else null.
+function decodeToken(token) {
+  const raw = token.split("\\x").join("");
+  if (token.indexOf("%") !== -1) {
+    if ((token.match(/%[0-9A-Fa-f]{2}/g) || []).length < 4) return null;
+    let decoded;
+    try {
+      decoded = decodeURIComponent(token);
+    } catch (e) {
+      return null;
+    }
+    return decoded !== token && printable(decoded) ? decoded : null;
+  }
+  if (/^(?:[0-9A-Fa-f]{2}){8,}$/.test(raw)) {
+    const bytes = new Uint8Array(raw.length / 2);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(raw.substr(i * 2, 2), 16);
+    const decoded = utf8(bytes);
+    if (decoded !== null && printable(decoded)) return decoded;
+  }
+  const body = token.replace(/=+$/, "").replace(/-/g, "+").replace(/_/g, "/");
+  if (body.length % 4 === 1 || !/^[A-Za-z0-9+/]+$/.test(body)) return null;
+  const decoded = decodeBase64(body + "=".repeat((4 - (body.length % 4)) % 4));
+  return decoded !== null && printable(decoded) ? decoded : null;
+}
+
+function decodedInstruction(decoded, depth) {
+  depth = depth || 1;
+  if (isInstruction(decoded)) return decoded;
+  if (depth < 2) {
+    for (const rx of [B64_TOKEN, HEX_TOKEN, PCT_TOKEN]) {
+      for (const m of matches(rx, decoded)) {
+        const inner = decodeToken(m[0]);
+        if (inner && decodedInstruction(inner, depth + 1)) return inner;
+      }
+    }
+  }
+  return null;
+}
+
+function encodedSpansWide(text) {
+  const spans = [];
+  const pieces = [];
+  for (const rx of [B64_TOKEN, HEX_TOKEN, PCT_TOKEN]) {
+    for (const m of matches(rx, text)) {
+      const decoded = decodeToken(m[0]);
+      if (decoded === null) continue;
+      const end = m.index + m[0].length;
+      pieces.push([m.index, end, decoded]);
+      const found = decodedInstruction(decoded);
+      if (found) spans.push([m.index, end, found]);
+    }
+  }
+  // A payload split over concatenated string literals ("SWdu..." + "aW5z...").
+  pieces.sort(bySpan);
+  for (let i = 0; i < pieces.length - 1; i++) {
+    const a = pieces[i];
+    const b = pieces[i + 1];
+    const gap = text.slice(a[1], b[0]).trim();
+    if (JOINED_STRINGS.test(gap) || !gap) {
+      const joined = a[2] + b[2];
+      if (isInstruction(joined) && !(isInstruction(a[2]) && isInstruction(b[2]))) spans.push([a[0], b[1], joined]);
+    }
+  }
+  for (const [lineStart, line] of linesWithOffsets(text)) {
+    const rotated = rot13(line);
+    for (const [s, e] of instructionSpans(rotated)) {
+      if (!instructionSpans(line.slice(s, e)).length) spans.push([lineStart + s, lineStart + e, rotated.slice(s, e)]);
+    }
+  }
+  return spans;
+}
+
+/** The decoded instructions found in text (empty array: none). */
+export function findEncodedPrompts(text) {
+  if (typeof text !== "string" || !text) return [];
+  return encodedSpansWide(text).sort(bySpan).map((s) => s[2]);
+}
+
+/** text with each encoded instruction (base64, URL-safe base64, hex, percent, ROT13) replaced by <encoded_prompts_removed>. */
+export function removeEncodedPrompts(text) {
+  if (typeof text !== "string") return structured(text, removeEncodedPrompts);
+  const spans = encodedSpansWide(text);
+  return spans.length ? replaceSpans(text, spans, "<encoded_prompts_removed>") : text;
+}
+
+// Leetspeak: each letter also matches its usual substitutes (1 ! | for i and l, 3 for e,
+// 0 for o, 4 @ for a, 5 $ for s, 7 + for t ...); letters may be spaced out, with a wider
+// gap between words. A match of this wider list counts only if it uses a substitute or
+// spaced letters; the plain phrases sanitizePrompt removes are removed too.
+const LEET_LETTERS = { a: "a4@", b: "b8", e: "e3", g: "g96", i: "i1!|l", l: "l1|i", o: "o0", s: "s5$", t: "t7+", z: "z2" };
+
+function leetWord(word) {
+  return Array.from(word).map((ch) => "[" + (LEET_LETTERS[ch] || ch).replace(/[\\\]^-]/g, "\\$&") + "]").join(" ?");
+}
+
+function leetAny(words) {
+  return "(?:" + words.slice().sort((a, b) => b.length - a.length).map(leetWord).join("|") + ")";
+}
+
+const GAP = "\\s+";
+const LEET_PROMPT = new RegExp(
+  leetAny(["ignore", "disregard", "forget", "override", "bypass"]) + GAP
+  + "(?:" + leetAny(["all", "any", "the", "your", "my", "previous", "prior", "above", "earlier",
+                     "safety", "system", "original"]) + GAP + "){0,3}"
+  + leetAny(["instructions", "instruction", "rules", "guidelines", "restrictions", "prompt",
+             "prompts", "filters", "policies", "policy"])
+  + "|" + leetAny(["you"]) + GAP + leetAny(["are"]) + GAP + leetAny(["now"]) + GAP
+  + "(?:" + leetAny(["in", "an", "a"]) + GAP + ")?"
+  + leetAny(["dan", "unrestricted", "unfiltered", "jailbroken", "evil", "developer", "admin", "god"])
+  + "|" + leetAny(["reveal", "print", "show", "dump", "leak", "send"]) + GAP
+  + "(?:" + leetAny(["the", "your", "all", "me"]) + GAP + "){0,2}"
+  + leetAny(["system", "secrets", "secret", "passwords", "password", "credentials", "api"])
+  + "(?:" + GAP + leetAny(["prompt", "keys", "key"]) + ")?",
+  "gi");
+const LEET_MARK = /[0-9@$!|+]|(?<![A-Za-z])[A-Za-z] [A-Za-z] [A-Za-z](?![A-Za-z])/;
+
+function leetspeakSpans(text) {
+  const spans = phraseSpans(text).map(([s, e]) => [s, e, text.slice(s, e)]);
+  for (const [lineStart, line] of linesWithOffsets(text)) {
+    for (const m of matches(LEET_PROMPT, line)) {
+      // The rest of the line belongs to the same instruction ("... 4nd r3v34l ...").
+      if (LEET_MARK.test(m[0])) spans.push([lineStart + m.index, lineStart + line.trimEnd().length, m[0]]);
+    }
+    const folded = foldLeet(line);
+    if (folded !== line && hasShell(folded) && !hasShell(line)) {
+      const lead = line.length - line.replace(/^\s+/, "").length;
+      spans.push([lineStart + lead, lineStart + line.trimEnd().length, folded.trim()]);
+    }
+  }
+  return spans;
+}
+
+/** The leetspeak or letter-spaced instructions found in text (empty array: none). */
+export function findLeetspeakPrompts(text) {
+  if (typeof text !== "string" || !text) return [];
+  return leetspeakSpans(text).sort(bySpan).map(([s, e]) => text.slice(s, e));
+}
+
+/** text with each leetspeak or letter-spaced instruction (and the plain phrases sanitizePrompt removes) replaced by <leetspeak_prompts_removed>. */
+export function removeLeetspeakPrompts(text) {
+  if (typeof text !== "string") return structured(text, removeLeetspeakPrompts);
+  const spans = leetspeakSpans(text);
+  return spans.length ? replaceSpans(text, spans, "<leetspeak_prompts_removed>") : text;
+}
+
+// Command requests (AI_APP_SEC_059): a request to run a shell command or code with a
+// target. A word or file name on its own (exec, bash, setup.sh) or a question about one
+// is not a request.
+const RUN_VERB = "\\b(?:run|execute|exec|eval|evaluate|launch)\\b\\s*:?\\s*[`\"']?";
+const COMMAND_REQUEST = [
+  ["shell_command", new RegExp(RUN_VERB + CMD, "gi")],
+  ["shell_command", new RegExp(RUN_VERB + "(?:sudo\\s+)?(?:bash|sh|zsh|ksh|python3?|node|perl|ruby|php|"
+                               + "powershell|pwsh|cmd)\\s+(?:-\\w+\\s+)?\\S", "gi")],
+  ["code_execution", new RegExp(RUN_VERB + "[\\w.]+\\([^)\\n]*\\)", "g")],
+  ["secret_access", new RegExp(
+    "\\b(?:cat|type|print|echo|read|dump|show|send)\\b[^\\n]{0,40}"
+    + "(?:/etc/(?:passwd|shadow)|os\\.environ|process\\.env|\\.ssh/|\\.aws/credentials|\\$[A-Z_]*(?:KEY|TOKEN|SECRET))",
+    "gi")]
+];
+
+function commandRequestSpans(text) {
+  const spans = [];
+  for (const [category, pattern] of COMMAND_REQUEST) {
+    for (const m of matches(pattern, text)) spans.push([m.index, m.index + m[0].length, category]);
+  }
+  return spans;
+}
+
+function commandFindings(text, found) {
+  for (const s of commandRequestSpans(text)) found.add(s[2]);
+  if (matches(SHELL, text).length) found.add("shell_command");
+  for (const name of findCodeExecution(text)) found.add(name === "pipe_to_shell" ? "pipe_to_shell" : "code_execution");
+}
+
+/**
+ * The kinds of command-execution request in value (empty array: none): shell commands,
+ * code execution, piping a download into a shell, reading secrets; also when the request
+ * is hidden, encoded or written in leetspeak. Accepts a string, a list of chat messages or
+ * an object. The caller refuses the request (HTTP 400) and logs a fingerprint of it,
+ * never the text.
+ */
+export function findCommandRequests(value) {
+  const pieces = [];
+  if (typeof value === "string") pieces.push(value);
+  else structured(value, (s) => { pieces.push(s); return s; });
+  const found = new Set();
+  for (const piece of pieces) {
+    if (!piece) continue;
+    const variants = [piece, visible(piece)[0], foldLeet(piece)]
+      .concat(hiddenSpans(piece).map((s) => s[2]))
+      .concat(encodedSpansWide(piece).map((s) => s[2]));
+    for (const variant of variants) commandFindings(variant, found);
+  }
+  return Array.from(found).sort();
+}
 '''
 _UNIFAI_GUARD_DTS_SOURCE = r'''// Types for unifaiGuard.js, the prompt-injection and PII guard added by Lineaje UnifAI remediation.
 // UNIFAI-GUARD owner="Lineaje UnifAI": generated by UnifAI remediation scans; do not edit.
@@ -2338,6 +3400,27 @@ export declare function findShellCommands(text: unknown): string[];
 
 /** Uploaded or fetched content with each shell command replaced by <suspicious_content_removed>. */
 export declare function removeSuspiciousContent<T>(text: T): T;
+
+/** The instructions hidden in text (HTML comments, invisible elements, zero-width or Unicode tag characters), made readable. */
+export declare function findHiddenPrompts(text: unknown): string[];
+
+/** text with each hidden instruction replaced by <hidden_prompts_removed>; same type in, same type out. */
+export declare function removeHiddenPrompts<T>(text: T): T;
+
+/** The decoded instructions found in text (base64, URL-safe base64, hex, percent, ROT13). */
+export declare function findEncodedPrompts(text: unknown): string[];
+
+/** text with each encoded instruction replaced by <encoded_prompts_removed>; same type in, same type out. */
+export declare function removeEncodedPrompts<T>(text: T): T;
+
+/** The leetspeak or letter-spaced instructions found in text (empty array: none). */
+export declare function findLeetspeakPrompts(text: unknown): string[];
+
+/** text with each leetspeak or letter-spaced instruction replaced by <leetspeak_prompts_removed>; same type in, same type out. */
+export declare function removeLeetspeakPrompts<T>(text: T): T;
+
+/** The kinds of command-execution request in a prompt, chat message list or object (empty array: none); refuse the request when any is found. */
+export declare function findCommandRequests(value: unknown): string[];
 '''
 # --- END UNIFAI_GUARD_SOURCE ---
 
@@ -2427,14 +3510,25 @@ def _collapse_stub_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _is_site_policies_file(rel: str) -> bool:
+    """A per-site candidate_policies file (``.lineaje/sites/<key>.json``). These stay out of the
+    PR: without one, gr_stub_client registers the site from the Guardrail's own catalog."""
+    return rel.startswith(".lineaje/sites/") or "/.lineaje/sites/" in f"/{rel}"
+
+
 def _stub_insertions_from_mcp_result(mcp_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Merge stub_insertions with patched_files / companion_files from the MCP response."""
-    stubs = [dict(s) for s in (mcp_result.get("stub_insertions") or [])]
+    stubs = [dict(s) for s in (mcp_result.get("stub_insertions") or [])
+             if not _is_code_fix_type(s)
+             and not _is_site_policies_file(_norm_stub_relpath(s.get("file") or ""))]
     by_file: Dict[str, str] = {}
     for extra in list(mcp_result.get("patched_files") or []) + list(mcp_result.get("companion_files") or []):
-        if not isinstance(extra, dict):
+        if not isinstance(extra, dict) or _is_code_fix_type(extra):
             continue
         rel = _norm_stub_relpath(extra.get("file") or "")
+        # .env is the customer's own file and may hold credentials: the PR carries .env.example only
+        if _is_site_policies_file(rel) or os.path.basename(rel) == ".env":
+            continue
         if rel and extra.get("content") is not None:
             by_file[rel] = extra["content"]
     if not by_file:
@@ -3032,7 +4126,10 @@ def apply_stub_insertions_to_clone(
             )
             marker = _GR_CHECK_MARKERS.get(ext, "def gr_check(")
             if import_block and marker not in "".join(lines):
-                lines.insert(safe_prefix_insert_index(lines), import_block.rstrip("\n") + "\n")
+                if ext == ".go":
+                    insert_go_helper(lines, import_block)
+                else:
+                    lines.insert(safe_prefix_insert_index(lines), import_block.rstrip("\n") + "\n")
 
         new_content = "".join(lines)
         if ext == ".py":
@@ -3051,11 +4148,15 @@ _HARDCODED_GR_ORIGIN = (
     lambda _p: f"{_p.scheme}://{_p.netloc}" if _p.scheme and _p.netloc else ""
 )(urllib.parse.urlsplit(MCP_SERVER_URL))
 _ENV_EXAMPLE_HEADER = (
-    "# Lineaje UnifAI guardrail stub runtime configuration.\n"
-    "# Generated by the Lineaje hybrid scan — read directly by gr_stub_client.py's\n"
-    "# env-var overrides at POST /enforce time.\n"
-    "# If the Lineaje GR/guardrail service runs on the same VM as this codebase,\n"
-    "# use https://localhost/enforce instead of a public IP or hostname.\n"
+    "# Lineaje UnifAI Guardrail settings\n"
+    "#\n"
+    "# 1. Copy every KEY=VALUE line below into your application's .env file\n"
+    "#    (or set them as environment variables where your application runs).\n"
+    "# 2. Set LINEAJE_REFRESH_TOKEN to your Lineaje refresh token (it is left empty here).\n"
+    "# 3. Restart your application.\n"
+    "#\n"
+    "# LINEAJE_REFRESH_TOKEN is a credential: keep it secret and never commit\n"
+    "# your real .env file.\n"
     "\n"
 )
 
@@ -3118,47 +4219,66 @@ def _upsert_env_file_content(existing_text: str, updates: Dict[str, str], header
     return "\n".join(new_lines) + "\n"
 
 
+def _stub_scan_context(stub_records: Sequence[Dict[str, Any]], branch: str = "") -> Dict[str, str]:
+    """What every stub shares and no stub repeats, for ``gr_stub_client.py``'s ``SCAN_CONTEXT``: the
+    application (``components.identity.app`` of the scan's stub records: ``app_name`` / ``app_version`` /
+    ``app_purl``, plus ``app_branch``) and the scan's ``project`` / ``organization``. Empty values are left out."""
+    app: Dict[str, Any] = {}
+    project = organization = ""
+    for rec in stub_records or []:
+        rec = rec or {}
+        found = ((rec.get("components") or {}).get("identity") or {}).get("app")
+        if not app and isinstance(found, dict) and (found.get("purl") or found.get("name")):
+            app = found
+        project = project or str(rec.get("project") or "")
+        organization = organization or str(rec.get("organization") or "")
+    ctx = {"app_name": app.get("name"), "app_version": app.get("version"), "app_purl": app.get("purl"),
+           "app_branch": branch, "project": project, "organization": organization}
+    return {k: str(v) for k, v in ctx.items() if v}
+
+
+_SCAN_CONTEXT_LINE_RE = re.compile(r"^SCAN_CONTEXT: dict = .*$", re.MULTILINE)
+
+
+def _stamp_scan_context(validated_fixes: Dict[str, str], scan_context: Dict[str, str]) -> None:
+    """Stamp ``scan_context`` into the PR's ``gr_stub_client.py`` (its ``SCAN_CONTEXT: dict = {}`` line)."""
+    rel = next((p for p in validated_fixes if _norm_stub_relpath(p) == "gr_stub_client.py"), "")
+    text = validated_fixes.get(rel) if rel else None
+    if not scan_context or not isinstance(text, str) or not _SCAN_CONTEXT_LINE_RE.search(text):
+        return
+    validated_fixes[rel] = _SCAN_CONTEXT_LINE_RE.sub(
+        lambda _m: f"SCAN_CONTEXT: dict = {dict(sorted(scan_context.items()))!r}", text, count=1)
+
+
+def _scim_renew_access_token_url() -> str:
+    """The SCIM renew-access-token of the Lineaje environment MCP_SERVER_URL names (as the renew URL above)."""
+    if _lineaje_env_is_dev():
+        return "https://scim-service.commercialdev.dev.veedna.com/scim/api/v1/auth/native/renew-access-token"
+    return _LINEAJE_SCIM_RENEW_ACCESS_TOKEN_URL_PROD
+
+
 def _ensure_env_example_in_validated_fixes(
     validated_fixes: Dict[str, str],
     source_dir: str = "",
-    refresh_token: str = "",
     server_url: str = "",
 ) -> None:
-    """Write this scan's own SCIM refresh token + MCP server origin into
-    customer ``.env.example`` as ``GR_SERVICE_URL`` / ``LINEAJE_REFRESH_TOKEN``
-    — the exact env vars ``gr_stub_client.py`` reads as overrides at
-    POST /enforce time. Mirrors ``gha_repo_scan.py``'s
-    ``_ensure_refresh_token_in_validated_fixes`` and mcp_server.py's
-    ``_write_guardrail_runtime_manifest`` so all three insertion paths ship
-    the same runtime config file.
+    """The customer ``.env.example``: the endpoints ``gr_stub_client.py`` calls (``GR_SERVICE_URL``,
+    ``GR_HEARTBEAT_URL``, ``LINEAJE_RENEW_ACCESS_TOKEN_URL``) and an empty ``LINEAJE_REFRESH_TOKEN=`` for the
+    customer to fill in. Nothing else: no credential is minted or written, and what the stubs share (app,
+    project) is in ``gr_stub_client.py``'s ``SCAN_CONTEXT``. Any other key already in the file is dropped.
     """
     rel = _GUARDRAIL_MANIFEST_REL
-    rt = _usable_scan_refresh_token(refresh_token)
-    existing_text = validated_fixes.get(rel, "")
-    m = re.search(r"^LINEAJE_REFRESH_TOKEN=(.*)$", existing_text, re.MULTILINE)
-    # This scan's own credential (rt) wins over whatever was already written
-    # (keep) — a pre-existing value here is at best a separately-minted
-    # credential for some other tenant, never the one that actually ran this
-    # scan. Only fall back to it when this script somehow has no usable
-    # token of its own.
-    keep = _usable_scan_refresh_token(m.group(1).strip() if m else "")
-    token = rt or keep
-    if not token:
-        logger.warning(
-            "No SCIM refresh token for %s — set LINEAJE_PAT_TOKEN "
-            "(do not store a JWT or lineaje_pat_ identity PAT)",
-            rel,
-        )
-        return
-    # Likewise: the MCP server URL this scan actually used (minus its /mcp
-    # path) wins over the hardcoded hosted SaaS origin — a customer's own
-    # runtime guardrail stub cannot reach "localhost" meaning this runner,
-    # which is why --mcp-server-url is sometimes pointed at localhost/a
-    # private IP to route around Azure's public-IP hairpin-NAT limitation.
+    # The MCP server URL this scan actually used (minus its /mcp path) wins over the hardcoded hosted SaaS
+    # origin — a customer's own runtime guardrail stub cannot reach "localhost" meaning this runner,
+    # which is why --mcp-server-url is sometimes pointed at localhost/a private IP to route around
+    # Azure's public-IP hairpin-NAT limitation.
     base = _origin_for_gr_manifest(server_url) or _HARDCODED_GR_ORIGIN
     updated = _upsert_env_file_content(
-        existing_text,
-        {"GR_SERVICE_URL": f"{base}/enforce", "LINEAJE_REFRESH_TOKEN": token},
+        "",
+        {"GR_SERVICE_URL": f"{base}/enforce",
+         "GR_HEARTBEAT_URL": f"{base}/heartbeat",
+         "LINEAJE_RENEW_ACCESS_TOKEN_URL": _scim_renew_access_token_url(),
+         "LINEAJE_REFRESH_TOKEN": ""},
         _ENV_EXAMPLE_HEADER,
     )
     validated_fixes[rel] = updated
@@ -3170,7 +4290,66 @@ def _ensure_env_example_in_validated_fixes(
                 fh.write(updated)
         except OSError as exc:
             logger.warning("Could not write %s: %s", dest, exc)
-    logger.info("Customer %s LINEAJE_REFRESH_TOKEN=set (SCIM refresh token)", rel)
+    logger.info("Customer %s: endpoints only, LINEAJE_REFRESH_TOKEN left empty to fill in", rel)
+
+
+# Root app purl inputs sent with the commit sha (X-Unifai-Commit-Time, X-Unifai-Build-File),
+# set once per scan by _set_app_purl_headers.
+_APP_PURL_HEADERS: Dict[str, str] = {}
+
+# Root build files, most specific first (pipeline.relations.site_components._BUILD_FILES).
+_BUILD_FILES = (
+    "package.json", "pyproject.toml", "requirements.txt", "setup.py", "Pipfile", "pom.xml",
+    "build.gradle", "build.gradle.kts", "go.mod", "Cargo.toml", "Gemfile", "composer.json",
+)
+
+
+def _primary_build_file(files: Sequence[str]) -> str:
+    """The repo's build file: at the root when there is one, else the shallowest."""
+    rank = {n: i for i, n in enumerate(_BUILD_FILES)}
+    found = [f.replace("\\", "/") for f in files if f.replace("\\", "/").rsplit("/", 1)[-1] in rank]
+    if not found:
+        return ""
+    return min(found, key=lambda f: (f.count("/"), rank[f.rsplit("/", 1)[-1]], f))
+
+
+def _commit_time(source_path: str, repo: str, head_sha: str, github_token: str = "") -> str:
+    """Commit time in git ``%ci`` form (``2026-08-10 21:37:49 +0000``): from the local
+    checkout when it still has .git, else from the GitHub API; "" when neither works."""
+    if not head_sha:
+        return ""
+    try:
+        # UTC, like the FM scanner's commit-time (``2026-08-10 21:37:49 +0000``).
+        out = subprocess.run(["git", "-C", source_path, "log", "-1",
+                              "--date=format-local:%Y-%m-%d %H:%M:%S +0000", "--format=%cd", head_sha],
+                             capture_output=True, text=True, timeout=10, env={**os.environ, "TZ": "UTC"})
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    slug = _normalize_github_repo_slug(repo) if repo else ""
+    if slug and (os.environ.get("GITHUB_REPOSITORY") or github_token):
+        try:
+            date = _GitHubClient(token=github_token)._request(
+                "GET", f"/repos/{slug}/commits/{head_sha}")["commit"]["committer"]["date"]
+            return datetime.strptime(date, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d %H:%M:%S +0000")
+        except Exception as exc:
+            logger.info("Commit time for %s not found on GitHub: %s", head_sha[:7], exc)
+    return ""
+
+
+def _set_app_purl_headers(source_path: str, repo: str, head_sha: str, files: Sequence[str],
+                          github_token: str = "") -> None:
+    """Commit time and build file the MCP server puts in the root app purl."""
+    _APP_PURL_HEADERS.clear()
+    commit_time = _commit_time(source_path, repo, head_sha, github_token)
+    build_file = _primary_build_file(files)
+    if commit_time:
+        _APP_PURL_HEADERS["X-Unifai-Commit-Time"] = commit_time
+    if build_file:
+        _APP_PURL_HEADERS["X-Unifai-Build-File"] = build_file
+    logger.info("App purl inputs: commit=%s time=%s build_file=%s",
+                head_sha[:7] if head_sha else "-", commit_time or "-", build_file or "-")
 
 
 def _run_mcp_scan_via_client(
@@ -3202,7 +4381,7 @@ def _run_mcp_scan_via_client(
             upload_args["run_id"] = resolved_run_id
         with open(archive_path, "rb") as _fh:
             upload_args["archive_content_base64"] = base64.b64encode(_fh.read()).decode("ascii")
-        scm_headers: Dict[str, str] = {"X-Unifai-Commit-Sha": head_sha} if head_sha else {}
+        scm_headers: Dict[str, str] = {"X-Unifai-Commit-Sha": head_sha, **_APP_PURL_HEADERS} if head_sha else {}
 
         tok1 = bearer_getter()
         async with streamablehttp_client(
@@ -3230,7 +4409,7 @@ def _run_mcp_scan_via_client(
             _upload_to_s3(presigned_url, archive_path)
 
         tok2 = bearer_getter()
-        sse_timeout = int(os.environ.get("UNIFAI_MCP_SSE_READ_TIMEOUT", "1800"))
+        sse_timeout = mcp_sse_read_timeout()
         async with streamablehttp_client(
             server_url,
             headers={"Authorization": f"Bearer {tok2}", **scm_headers},
@@ -3286,6 +4465,250 @@ def run_mcp_scan(
         head_sha=head_sha, is_last_batch=is_last_batch, sbom_id=sbom_id, run_id=run_id,
     )
 
+def request_fix_pr_via_mcp(
+    server_url: str,
+    bearer_getter: Callable[[], str],
+    source_code_repo: str,
+    branch: str,
+    sbom_id: str,
+    *,
+    head_sha: str = "",
+    run_id: str = "",
+    fix_type: str = "code-insert",
+    files: Sequence[str] = (),
+) -> Dict[str, Any]:
+    """Ask the MCP server to raise the fix PR the SBOM 360 AI Remediate way
+    (``lineaje_create_fix_pr``: GPT /explain "Apply fix left plan" for this sbom). The
+    platform's agents open the PR from the scan's uploaded code_fix.json; this returns
+    the remediation task ids, whose ``task_context.pr_link`` carries the PR once raised."""
+    from mcp import ClientSession
+
+    async def _call() -> Dict[str, Any]:
+        scm_headers: Dict[str, str] = {"X-Unifai-Commit-Sha": head_sha, **_APP_PURL_HEADERS} if head_sha else {}
+        async with streamablehttp_client(
+            server_url, headers={"Authorization": f"Bearer {bearer_getter()}", **scm_headers},
+            sse_read_timeout=mcp_sse_read_timeout(),
+        ) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tool_args: Dict[str, Any] = {
+                    "sbom_id": sbom_id,
+                    "source_code_repo": source_code_repo,
+                    "branch_or_tag": branch,
+                    "fix_types": [fix_type],
+                    "files": sorted(files),
+                }
+                if run_id:
+                    tool_args["run_id"] = run_id
+                return _parse_tool_result(await session.call_tool("lineaje_create_fix_pr", arguments=tool_args))
+
+    logger.info("Requesting %s PR through Lineaje (sbom=%s, %d file(s))", fix_type, sbom_id, len(files))
+    return asyncio.run(_call())
+
+
+# ===========================================================================
+# Fix PR through the Lineaje GPT service /explain (the FM scanner flow)
+# ===========================================================================
+#
+# The scan has already uploaded every fix (code_fix.json: diff + changes per finding)
+# with the sbom's entity tarball; the platform builds the sbom's plan from it. Two
+# /explain requests then raise the PR:
+#   1. "Recommend a fix plan" — reads the sbom's plan (plan_details)
+#   2. "Apply fix left plan"  — creates the remediation tasks from the plan's source-code
+#      (private) entries; the platform's executor creates branch, commit and PR, and the
+#      PR link lands on the task (task_context.pr_link).
+# Every request is async: the first POST returns a guid, re-POSTing with it polls.
+
+EXPLAIN_FIX_PLAN_QUERY = "Recommend a fix plan"
+EXPLAIN_APPLY_FIX_QUERY = "Apply fix left plan"
+_EXPLAIN_POLL_INTERVAL_SEC = 20
+_EXPLAIN_MAX_POLLS = 20
+# The platform builds the sbom's plan from the uploaded code_fix.json after the scan; until it has, "Recommend a fix
+# plan" answers "No fix plan data found" (an error, not "still processing"). Ask again every poll interval, this
+# many times (UNIFAI_FIX_PLAN_ATTEMPTS; default 30 = 10 minutes at 20s), before giving up.
+_FIX_PLAN_NOT_READY = "no fix plan data found"
+_DEFAULT_FIX_PLAN_ATTEMPTS = 30
+
+
+def _fix_plan_attempts() -> int:
+    try:
+        return max(1, int((os.environ.get("UNIFAI_FIX_PLAN_ATTEMPTS") or "").strip() or _DEFAULT_FIX_PLAN_ATTEMPTS))
+    except ValueError:
+        return _DEFAULT_FIX_PLAN_ATTEMPTS
+
+
+def _jwt_claims(token: str) -> Dict[str, Any]:
+    """Unverified claims of a JWT access token; {} when it is not one."""
+    parts = (token or "").split(".")
+    if len(parts) != 3:
+        return {}
+    try:
+        body = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(body.encode("ascii")).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+class ExplainClient:
+    """Minimal client for the GPT service's ``POST /api/v1/explain`` (stdlib only)."""
+
+    def __init__(self, base_url: str, bearer_getter: Callable[[], str], *, product_id: str = "",
+                 poll_interval: float = _EXPLAIN_POLL_INTERVAL_SEC, max_polls: int = _EXPLAIN_MAX_POLLS):
+        base = (base_url or "").rstrip("/")
+        self.url = base if base.endswith("/explain") else (
+            f"{base}/explain" if base.endswith("/api/v1") else f"{base}/api/v1/explain")
+        self._bearer_getter = bearer_getter
+        self._product_id = (product_id or "").strip()
+        self._poll_interval = poll_interval
+        self._max_polls = max(1, max_polls)
+
+    def identity(self) -> Dict[str, str]:
+        """tenant / company / product / user of the access token (the request headers)."""
+        claims = _jwt_claims(self._bearer_getter())
+        meta = claims.get("user_metadata") if isinstance(claims.get("user_metadata"), dict) else {}
+        product = (self._product_id or str(meta.get("active_product_id") or meta.get("product_id") or "")
+                   or "1")
+        return {
+            "tenant-id": str(meta.get("tenant_id") or ""),
+            "company-id": str(meta.get("company_id") or ""),
+            "active-product-id": product,
+            "product-id": product,
+            "user-id": str(claims.get("sub") or ""),
+            "user-email": str(claims.get("email") or meta.get("email") or ""),
+        }
+
+    def _post(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        headers = {"Accept": "application/json", "Content-Type": "application/json",
+                   "Authorization": f"Bearer {self._bearer_getter()}"}
+        headers.update({k: v for k, v in self.identity().items() if v})
+        req = urllib.request.Request(self.url, data=json.dumps(body).encode("utf-8"),
+                                     headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"{body.get('query')!r}: HTTP {exc.code}: {detail[:500]}") from exc
+        data = json.loads(raw) if raw.strip() else {}
+        return data if isinstance(data, dict) else {}
+
+    def run(self, query: str, body: Dict[str, Any], *, until_tasks: bool = False) -> Dict[str, Any]:
+        """POST *query* and poll its guid until the job completes (or, with *until_tasks*,
+        until it reports ``task_ids``). Raises ``RuntimeError`` on an error or time-out."""
+        res = self._post({"query": query, **body})
+        guid = res.get("guid")
+        for poll in range(self._max_polls + 1):
+            if res.get("error") is True:
+                raise RuntimeError(f"{query!r} failed: {res.get('message') or res}")
+            if until_tasks and res.get("task_ids"):
+                return res
+            message = str(res.get("message") or "").lower()
+            if poll and "still processing" not in message:
+                return res
+            if not guid:
+                return res  # answered synchronously
+            if poll == self._max_polls:
+                break
+            time.sleep(self._poll_interval)
+            res = self._post({"query": query, "guid": guid, **body})
+            guid = res.get("guid") or guid
+        raise RuntimeError(f"{query!r} did not complete after {self._max_polls} polls (guid {guid})")
+
+
+def _vuln_fixed_ids(entry: Dict[str, Any]) -> List[str]:
+    """The entry's fixed finding ids: ``vuln_fixed`` (list) or, when the plan only carries
+    ``vuln_fixed_with_severity`` ({severity: [ids]}), those ids flattened."""
+    if entry.get("vuln_fixed"):
+        return [str(v) for v in entry["vuln_fixed"]]
+    by_sev = entry.get("vuln_fixed_with_severity")
+    if not isinstance(by_sev, dict):
+        return []
+    return [str(v) for ids in by_sev.values() for v in (ids or [])]
+
+
+def _source_fix_components(plan_details: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The plan entries "Apply fix left plan" can raise a source-code PR for: private plans,
+    i.e. the scan's own findings (``LVE-*`` ids), not dependency upgrades. Apply reads
+    ``vuln_fixed``, so an entry that only has ``vuln_fixed_with_severity`` gets it filled in."""
+    out = []
+    for entry in plan_details or []:
+        if not isinstance(entry, dict):
+            continue
+        vulns = _vuln_fixed_ids(entry)
+        if str(entry.get("type") or "").lower() == "private" or any(v.startswith("LVE-") for v in vulns):
+            out.append({**entry, "vuln_fixed": vulns} if vulns and not entry.get("vuln_fixed") else entry)
+    return out
+
+
+def request_fix_pr_via_explain(
+    gpt_url: str,
+    bearer_getter: Callable[[], str],
+    source_code_repo: str,
+    branch: str,
+    sbom_id: str,
+    *,
+    head_sha: str = "",
+    run_id: str = "",
+    product_id: str = "",
+    client: Optional[ExplainClient] = None,
+    plan_attempts: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Raise the fix PR for *sbom_id* the FM scanner way (see the section comment). A plan the platform has not built
+    yet is asked for again (``plan_attempts``, default ``UNIFAI_FIX_PLAN_ATTEMPTS``) before the request fails.
+
+    Returns ``{"task_ids", "plan_details", "components", "message"}``; ``task_ids`` is
+    empty (and ``message`` says why) when the plan has nothing to apply."""
+    api = client or ExplainClient(gpt_url, bearer_getter, product_id=product_id)
+    logger.info("Fix PR via %s — sbom=%s", api.url, sbom_id)
+
+    logger.info("[1/2] %r — reading the fix plan", EXPLAIN_FIX_PLAN_QUERY)
+    attempts = plan_attempts if plan_attempts is not None else _fix_plan_attempts()
+    for attempt in range(1, attempts + 1):
+        try:
+            plan = api.run(EXPLAIN_FIX_PLAN_QUERY, {
+                "sbom_id": sbom_id, "options": {"include_pr_history": False, "include_artifacts": False}})
+            break
+        except RuntimeError as exc:
+            if _FIX_PLAN_NOT_READY not in str(exc).lower() or attempt == attempts:
+                raise
+            logger.info("Fix plan for %s not built yet (attempt %d/%d) — asking again in %ss",
+                        sbom_id, attempt, attempts, api._poll_interval)
+            time.sleep(api._poll_interval)
+    meta = plan.get("meta_data") if isinstance(plan.get("meta_data"), dict) else {}
+    plan_details = [p for p in (meta.get("plan_details") or []) if isinstance(p, dict)]
+    components = _source_fix_components(plan_details)
+    logger.info("Fix plan: %d entr(ies), %d source-code fix(es)", len(plan_details), len(components))
+    if not components:
+        return {"task_ids": [], "plan_details": plan_details, "components": [],
+                "message": "the fix plan has no source-code (private) fixes to apply"}
+
+    logger.info("[2/2] %r — %d component(s) on %s", EXPLAIN_APPLY_FIX_QUERY, len(components), branch)
+    apply_body: Dict[str, Any] = {
+        "sbom_id": sbom_id,
+        "sbom_name": source_code_repo,
+        "branch_name": branch,
+        "metadata": {
+            "source_code_url": source_code_repo,
+            "branch_name": branch,
+            "head_sha": head_sha,
+            "run_id": run_id,
+            "components": components,
+        },
+    }
+    reporter = api.identity().get("user-email") or ""
+    if reporter:
+        apply_body["reporter"] = reporter
+    res = api.run(EXPLAIN_APPLY_FIX_QUERY, apply_body, until_tasks=True)
+    task_ids = [str(t) for t in (res.get("task_ids") or []) if t]
+    return {
+        "task_ids": task_ids, "plan_details": plan_details, "components": components,
+        "message": (f"{len(task_ids)} remediation task(s) created; the PR link appears on the "
+                    "task once the platform raises it" if task_ids
+                    else f"no tasks created: {res.get('message') or res.get('answer') or res}"),
+    }
+
+
 # ===========================================================================
 # Parallel batch scan
 # ===========================================================================
@@ -3302,6 +4725,7 @@ def parallel_batch_scan(
     bearer_getter: Callable[[], str],
     max_workers: int = MAX_SCAN_WORKERS,
     manifest_files: Optional[List[str]] = None,
+    sbom_id: str = "",
 ) -> Tuple[
     List[Dict[str, Any]], List[Dict[str, Any]], List[str], List[Dict[str, str]],
     int, List[str], List[Dict[str, Any]], Dict[str, Any],
@@ -3312,12 +4736,15 @@ def parallel_batch_scan(
     all_aibom: List[Dict[str, str]] = []
     all_stub_insertions: List[Dict[str, Any]] = []
     # What the server PUT to Lineaje S3, plus whether any batch's source archive went too.
-    uploaded: Dict[str, Any] = {"entities": [], "findings": [], "source_archive_s3_uploaded": None}
+    uploaded: Dict[str, Any] = {"entities": [], "findings": [], "source_archive_s3_uploaded": None,
+                                "sbom_id": "", "run_id": ""}
     aibom_seen: set = set()
     failed_batch_count = 0
     failure_details: List[str] = []
     lock = threading.Lock()
-    scan_sbom_id = ""
+    # --sbom-id (the job the platform created, e.g. from an SQS input.json): every batch,
+    # batch 1 included, scans under it instead of the server resolving one.
+    scan_sbom_id = (sbom_id or "").strip()
 
     def _scan_leaf(label: str, batch_files: List[str]) -> Dict[str, Any]:
         nonlocal scan_sbom_id
@@ -3332,10 +4759,18 @@ def parallel_batch_scan(
             server_url, bearer_getter, source_code_repo, branch, batch_files, archive_path,
             head_sha=head_sha, is_last_batch=True, sbom_id=scan_sbom_id, run_id=run_id,
         )
+        # A server error is a failed batch (logged, counted, exit 1), never 0 findings.
+        err = _mcp_result_error(result)
+        if err:
+            raise RuntimeError(f"server error: {err}")
+        if "status" not in result:
+            logger.warning("Batch %s: analyze reply has no 'status' field (older server?)", label)
         with lock:
             resolved_sbom = (result.get("sbom_id") or "").strip()
             if resolved_sbom and not scan_sbom_id:
                 scan_sbom_id = resolved_sbom
+            uploaded["sbom_id"] = uploaded["sbom_id"] or resolved_sbom
+            uploaded["run_id"] = uploaded["run_id"] or (result.get("run_id") or "").strip()
         return result
 
     def _scan_one(batch_idx: int, batch_files: List[str]) -> Tuple[int, List[Tuple[str, Dict[str, Any]]]]:
@@ -3382,7 +4817,13 @@ def parallel_batch_scan(
             ]
         batch_report = mcp_result.get("report", "")
         batch_aibom = mcp_result.get("aibom", [])
-        batch_stub_insertions = _stub_insertions_from_mcp_result(mcp_result)
+        # Harness mode (P5-10): the instrumentation PR is built from the stubs-only file versions; the
+        # comment-only versions (code_fix_files) go to the code-fix PR. Without these keys: as before.
+        has_pr_sets = any(f in mcp_result for f in _HARNESS_PR_FILE_SETS)
+        batch_stub_insertions = _stub_insertions_from_mcp_result(
+            dict(mcp_result, patched_files=list(mcp_result.get("instrumentation_files") or []), companion_files=[])
+            if has_pr_sets else mcp_result
+        )
         # Errors the server hit while scanning this batch (a policy whose
         # evaluation failed, a remediation that crashed, ...). The batch itself
         # succeeded, so these don't count as a failed batch, but the results
@@ -3408,6 +4849,13 @@ def parallel_batch_scan(
                 all_reports.append(batch_report)
             uploaded["entities"].extend(mcp_result.get("uploaded_entities_json") or [])
             uploaded["findings"].extend(mcp_result.get("uploaded_findings_json") or [])
+            if has_pr_sets:
+                pr_sets = uploaded.setdefault("pr_file_sets", {f: {} for f in _HARNESS_PR_FILE_SETS})
+                for field in _HARNESS_PR_FILE_SETS:
+                    for entry in mcp_result.get(field) or []:
+                        rel = _norm_stub_relpath(entry.get("file") or "") if isinstance(entry, dict) else ""
+                        if rel and entry.get("content") is not None:
+                            pr_sets[field][rel] = entry["content"]
             src_flag = mcp_result.get("source_archive_s3_uploaded")
             if src_flag is not None:
                 uploaded["source_archive_s3_uploaded"] = bool(
@@ -3418,20 +4866,36 @@ def parallel_batch_scan(
                     aibom_seen.add(key)
                     all_aibom.append(entry)
 
-    workers = min(len(batches), max_workers)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_map = {executor.submit(_scan_one, idx, files): idx for idx, files in enumerate(batches, 1)}
-        for future in as_completed(future_map):
-            batch_idx = future_map[future]
-            try:
-                _, leaf_results = future.result()
-                for label, mcp_result in leaf_results:
-                    _collect(label, mcp_result)
-            except BaseException as exc:
-                failed_batch_count += 1
-                detail = f"Batch {batch_idx}/{len(batches)} failed: {_describe_exception(exc)}"
-                logger.error("%s", detail)
-                failure_details.append(detail)
+    def _finish(batch_idx: int, run: Callable[[], Tuple[int, List[Tuple[str, Dict[str, Any]]]]]) -> None:
+        nonlocal failed_batch_count
+        try:
+            _, leaf_results = run()
+            for label, mcp_result in leaf_results:
+                _collect(label, mcp_result)
+        except BaseException as exc:
+            failed_batch_count += 1
+            detail = f"Batch {batch_idx}/{len(batches)} failed: {_describe_exception(exc)}"
+            logger.error("%s", detail)
+            failure_details.append(detail)
+
+    # Batch 1 runs alone: it creates the scan's one sbom_id (and sets its SCIM sbom_info). The other
+    # batches are held until it finishes, then run in parallel under that sbom_id — started together,
+    # each would create its own SBOM and split the results across SBOM360 entries.
+    if not batches:
+        return (all_violations, all_remediation_actions, all_reports, all_aibom,
+                failed_batch_count, failure_details, all_stub_insertions, uploaded)
+    _finish(1, lambda: _scan_one(1, batches[0]))
+    if len(batches) > 1:
+        if scan_sbom_id:
+            logger.info("Batch 1 resolved sbom_id=%s — scanning the other %d batch(es) under it",
+                        scan_sbom_id, len(batches) - 1)
+        else:
+            logger.warning("Batch 1 returned no sbom_id — the other batches resolve their own")
+        rest = list(enumerate(batches, 1))[1:]
+        with ThreadPoolExecutor(max_workers=min(len(rest), max_workers)) as executor:
+            future_map = {executor.submit(_scan_one, idx, files): idx for idx, files in rest}
+            for future in as_completed(future_map):
+                _finish(future_map[future], future.result)
 
     return (
         all_violations, all_remediation_actions, all_reports, all_aibom,
@@ -3449,6 +4913,7 @@ _REPORT_SECTION_HEADERS = [
     "## Enforcement Summary",
     "### SECTION 1: AIBOM Discovery",
     "### SECTION 2: Policy Violations",
+    "### SECTION 2: Policy Intercepts",
     "### SECTION 3: Controls Enforced",
     "### AI Component Relationship Graph",
     "### Phase Timing",
@@ -3574,12 +5039,24 @@ def _dedupe_preserve_order(rows: List[str]) -> List[str]:
     return out
 
 
+# Appended by the MCP server to a report the OpenCode harness served (mcp_server.HARNESS_REPORT_MARKER);
+# the harness workflow template fails the job unless the step summary carries it on its own line.
+HARNESS_REPORT_MARKER = "<!-- unifai-harness: opencode -->"
+
+
+def _ends_with_harness_marker(report: Any) -> bool:
+    """True when the report's last non-blank line is the marker (where the server puts the one real marker)."""
+    lines = [ln for ln in (report if isinstance(report, str) else "").split("\n") if ln.strip()]
+    return bool(lines) and lines[-1].strip() == HARNESS_REPORT_MARKER
+
+
 def _merge_batch_reports(
     reports: List[str],
     *,
     total_violations: int,
     total_remediation_actions: int,
     total_elapsed: float,
+    total_intercepts: int = 0,
 ) -> str:
     """Combine each batch's own full markdown report into one report with a
     single Enforcement Summary, Section 1 (AIBOM Discovery), Section 2
@@ -3599,6 +5076,8 @@ def _merge_batch_reports(
     s1_rows: List[str] = []
     s2_header = s2_sep = None
     s2_rows: List[str] = []
+    s2i_header = s2i_sep = None
+    s2i_rows: List[str] = []
     s3_header = s3_sep = None
     s3_rows: List[str] = []
     mermaid_bodies: List[str] = []
@@ -3625,6 +5104,10 @@ def _merge_batch_reports(
         s2_header, s2_sep = s2_header or h, s2_sep or sep
         s2_rows.extend(rows)
 
+        h, sep, rows = _table_rows(sections.get("### SECTION 2: Policy Intercepts", ""))
+        s2i_header, s2i_sep = s2i_header or h, s2i_sep or sep
+        s2i_rows.extend(rows)
+
         h, sep, rows = _table_rows(sections.get("### SECTION 3: Controls Enforced", ""))
         s3_header, s3_sep = s3_header or h, s3_sep or sep
         s3_rows.extend(rows)
@@ -3646,12 +5129,18 @@ def _merge_batch_reports(
 
     s1_rows = _dedupe_preserve_order(s1_rows)
     s2_rows = _dedupe_preserve_order(s2_rows)
+    s2i_rows = _dedupe_preserve_order(s2i_rows)
+    if s2i_rows:
+        # A batch with no findings renders a "No policies with violations" row; drop
+        # it when another batch had intercepts.
+        s2_rows = [r for r in s2_rows if "No policies with violations" not in r]
     s3_rows = _dedupe_preserve_order(s3_rows)
 
     lines: List[str] = ["# LINEAJE AI POLICY REPORT", ""]
     status = "violations_found" if total_violations else "compliant"
     lines.append(
-        f"**Run summary:** `{status}` · violations={total_violations} · "
+        f"**Run summary:** `{status}` · violations={total_violations - total_intercepts} · "
+        f"intercepts={total_intercepts} · "
         f"remediation_actions={total_remediation_actions} · elapsed={total_elapsed:.1f}s"
     )
     lines.append("")
@@ -3695,13 +5184,21 @@ def _merge_batch_reports(
         lines.append("")
         lines.append("*No AI components discovered.*")
     lines.append("")
-    lines.append("### SECTION 2: Policy Violations")
-    lines.append("")
-    lines.append("*Each row is one **`policy_violation=true`** finding (file × policy).*")
-    lines.append("")
-    if s2_header:
-        lines.extend([s2_header, s2_sep, *s2_rows])
-    lines.append("")
+    if s2_rows or not s2i_rows:
+        lines.append("### SECTION 2: Policy Violations")
+        lines.append("")
+        lines.append("*Each row is one **`policy_violation=true`** finding (file × policy).*")
+        lines.append("")
+        if s2_header:
+            lines.extend([s2_header, s2_sep, *s2_rows])
+        lines.append("")
+    if s2i_rows:
+        lines.append("### SECTION 2: Policy Intercepts")
+        lines.append("")
+        lines.append("*Each row is one **`policy_violation=true`** finding (file × policy).*")
+        lines.append("")
+        lines.extend([s2i_header, s2i_sep, *s2i_rows])
+        lines.append("")
     lines.append("### SECTION 3: Controls Enforced")
     lines.append("")
     lines.append("#### Controls enforced")
@@ -3723,6 +5220,9 @@ def _merge_batch_reports(
         lines.append(f"| {phase} | {phase_totals[phase]:.1f}s |")
     lines.append(f"| **Total** | **{sum(phase_totals.values()):.1f}s** |")
     lines.append("")
+    if any(_ends_with_harness_marker(r) for r in reports):
+        lines.append(HARNESS_REPORT_MARKER)
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -3781,6 +5281,13 @@ def build_json_output(
 
 
 def print_human_output(output: Dict[str, Any]) -> None:
+    _print_human_report(output)
+    # Harness-served scans: the marker is the final step-summary line (5.1c workflow gate).
+    if _ends_with_harness_marker(output.get("report")):
+        print(HARNESS_REPORT_MARKER)
+
+
+def _print_human_report(output: Dict[str, Any]) -> None:
     status = output.get("status", "unknown")
     violations = output.get("violations", [])
     scan_errors = output.get("scan_errors", [])
@@ -3795,7 +5302,8 @@ def print_human_output(output: Dict[str, Any]) -> None:
     else:
         status_label = status
 
-    logger.info("Result: %s — %d violation(s)", status_label, len(violations))
+    intercepts = output.get("intercepts")
+    logger.info("Result: %s — %s", status_label, _findings_label(violations, intercepts))
 
     print("# UnifAI Security Report")
     print()
@@ -3807,6 +5315,16 @@ def print_human_output(output: Dict[str, Any]) -> None:
     rem_pr_url = output.get("remediation_pr_url", "")
     if rem_pr_url:
         print(f"**Remediation PR:** {rem_pr_url}")
+    if output.get("instrumentation_pr_url"):
+        print(f"**Instrumentation PR:** {output['instrumentation_pr_url']}")
+    if output.get("remediation_task_ids") and output.get("pr_mode") == "explain":
+        print(f"**Fix PR requested:** task(s) {', '.join(output['remediation_task_ids'])} "
+              "(remediation and instrumentation; the PR link appears on the task in Lineaje)")
+    elif output.get("remediation_task_ids"):
+        print(f"**Remediation PR requested:** task(s) {', '.join(output['remediation_task_ids'])} "
+              "(the PR link appears on the task in Lineaje)")
+    if output.get("instrumentation_task_ids"):
+        print(f"**Instrumentation PR requested:** task(s) {', '.join(output['instrumentation_task_ids'])}")
 
     if scan_errors:
         print("\n**Errors:**")
@@ -3814,12 +5332,157 @@ def print_human_output(output: Dict[str, Any]) -> None:
             print(f"- {err}")
         print()
 
-    if not violations:
+    if not violations and not intercepts:
         if status == "compliant":
             print("\nNo violations found.")
         _print_uploaded_artifacts(output)
         return
 
+    if intercepts is None:  # no stub step ran: intercepts are the intercept-policy findings
+        num_files = len({v.get("file") or v.get("file_path") or "(unknown)" for v in violations})
+        print(f"\n**{_findings_label(violations)} across {num_files} file(s)**\n")
+        code_fix = [v for v in violations if not _is_intercept(v)]
+        for title, group in (("Policy Violations", code_fix),
+                             ("Policy Intercepts", [v for v in violations if _is_intercept(v)])):
+            if group:
+                _print_findings_by_file(title, group)
+    else:
+        code_fix = [v for v in violations if not _is_intercept(v)]
+        num_files = len({v.get("file") or v.get("file_path") or "(unknown)" for v in code_fix}
+                        | {i["file"] for i in intercepts})
+        print(f"\n**{_findings_label(violations, intercepts)} across {num_files} file(s)**\n")
+        if code_fix:
+            _print_findings_by_file("Policy Violations", code_fix)
+        if intercepts:
+            _print_intercepts_by_file(intercepts)
+
+    _print_uploaded_artifacts(output)
+
+
+def _is_intercept(v: Dict[str, Any]) -> bool:
+    """An intercept (enforced by a runtime stub) unless its fix_type / policy_type is a code fix
+    (``CODE_FIX_TYPES``): ``intercept``, any other value and no value at all are intercepts."""
+    return not _is_code_fix_type(v)
+
+
+_SECTION_2_VIOLATIONS = "### SECTION 2: Policy Violations"
+_SECTION_2_INTERCEPTS = "### SECTION 2: Policy Intercepts"
+
+
+def _split_intercepts_in_report(report: str, violations: List[Dict[str, Any]]) -> str:
+    """Section 2 of the server's report as Policy Violations (findings whose policy
+    declares a non-intercept ``policy_type``) and Policy Intercepts (the rest), with
+    the run summary counting them apart."""
+    n_int = sum(1 for v in violations if _is_intercept(v))
+    if not report or not n_int:
+        return report
+    report = re.sub(r"violations=\d+", f"violations={len(violations) - n_int}", report, count=1)
+    if re.search(r"intercepts=\d+", report):
+        report = re.sub(r"intercepts=\d+", f"intercepts={n_int}", report, count=1)
+    else:
+        report = re.sub(r"(violations=\d+ · )", rf"\g<1>intercepts={n_int} · ", report, count=1)
+    if _SECTION_2_VIOLATIONS not in report:
+        return report
+
+    code_fix = {str(v.get("policy_name") or "").strip().lower()
+                for v in violations if not _is_intercept(v) and v.get("policy_name")}
+    start = report.index(_SECTION_2_VIOLATIONS)
+    nxt = report.find("\n### ", start + len(_SECTION_2_VIOLATIONS))
+    end = nxt + 1 if nxt != -1 else len(report)
+    lines = report[start:end].rstrip("\n").split("\n")
+    at = next((i for i, ln in enumerate(lines) if ln.strip().startswith("|")), None)
+    if at is None or at + 1 >= len(lines):
+        return report
+    head, table, rows, tail = lines[:at], lines[at:at + 2], [], []
+    for ln in lines[at + 2:]:
+        (rows if ln.strip().startswith("|") else tail).append(ln)
+
+    def _code_fix_row(row: str) -> bool:
+        cells = [c.strip().lower() for c in row.strip().strip("|").split("|")]
+        return any(c in code_fix for c in cells if c)
+
+    viol_rows = [r for r in rows if _code_fix_row(r)]
+    int_rows = [r for r in rows if not _code_fix_row(r) and "no policies with violations" not in r.lower()]
+    if not int_rows:
+        return report
+    blocks: List[str] = []
+    if viol_rows:
+        blocks.append("\n".join([*head, *table, *viol_rows]))
+    blocks.append("\n".join([_SECTION_2_INTERCEPTS, *head[1:], *table, *int_rows]))
+    section = "\n\n".join(blocks) + "\n" + "\n".join(tail)
+    return report[:start] + section.rstrip("\n") + "\n\n" + report[end:]
+
+
+def _stub_intercepts(
+    stubs: Sequence[Dict[str, Any]], applied_files: Any, violations: Sequence[Dict[str, Any]] = (),
+) -> List[Dict[str, Any]]:
+    """Every intercept of the scan: one per guardrail stub inserted in a file that made it
+    (``applied_files``), with the policies the stub enforces; plus each intercept-policy
+    finding in a file that got no stub. ``[{file, line, insertion_point, policies}]``."""
+    applied = {_norm_stub_relpath(f) for f in (applied_files or ())}
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for s in stubs or []:
+        rel = _norm_stub_relpath(s.get("file") or "") if isinstance(s, dict) else ""
+        if not rel or rel not in applied:
+            continue
+        key = (rel, int(s.get("line") or 0), s.get("site_id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        names: List[str] = []
+        for p in [*(s.get("site_policies") or []), *(s.get("candidate_policies") or []),
+                  *(s.get("policy_details") or [])]:
+            name = (p.get("policy_name") or p.get("policy_id")) if isinstance(p, dict) else ""
+            if name and name not in names:
+                names.append(name)
+        out.append({"file": rel, "line": key[1], "insertion_point": s.get("insertion_point") or "",
+                    "policies": names})
+    stubbed = {i["file"] for i in out}
+    for v in violations or []:
+        rel = _norm_stub_relpath(v.get("file") or v.get("file_path") or "")
+        if _is_intercept(v) and rel and rel not in stubbed:
+            out.append({"file": rel, "line": int(v.get("line") or 0), "insertion_point": "",
+                        "policies": [v.get("policy_name") or v.get("policy_id") or "(unknown)"]})
+    return sorted(out, key=lambda i: (i["file"], i["line"]))
+
+
+def _findings_label(violations: List[Dict[str, Any]],
+                    intercepts: Optional[List[Dict[str, Any]]] = None) -> str:
+    """``"2 violation(s) and 1 intercept(s)"`` — only the kinds present (violations when none).
+    With *intercepts* (``_stub_intercepts``) every stub site counts, not intercept findings."""
+    if intercepts is None:
+        n_int = sum(1 for v in violations if _is_intercept(v))
+        n_viol = len(violations) - n_int
+    else:
+        n_int = len(intercepts)
+        n_viol = sum(1 for v in violations if not _is_intercept(v))
+    parts = []
+    if n_viol or not n_int:
+        parts.append(f"{n_viol} violation(s)")
+    if n_int:
+        parts.append(f"{n_int} intercept(s)")
+    return " and ".join(parts)
+
+
+def _print_intercepts_by_file(intercepts: List[Dict[str, Any]]) -> None:
+    """``| File | Policy Intercepts |``: one numbered entry per stub site — its line,
+    insertion point and the policies it enforces."""
+    from collections import defaultdict
+    by_file: Dict[str, List[str]] = defaultdict(list)
+    for i in intercepts:
+        where = " ".join(p for p in (f"L{i['line']}" if i.get("line") else "", i.get("insertion_point") or "") if p)
+        policies = ", ".join(i.get("policies") or []) or "runtime guardrail"
+        by_file[i["file"]].append(f"{where}: {policies}" if where else policies)
+    title = "Policy Intercepts"
+    print(f"| File | {title} |")
+    print(f"|------|{'-' * (len(title) + 2)}|")
+    for file_, entries in sorted(by_file.items()):
+        print(f"| `{file_}` | {''.join(f'{n}. {e}<br>' for n, e in enumerate(entries, 1))} |")
+    print()
+
+
+def _print_findings_by_file(title: str, violations: List[Dict[str, Any]]) -> None:
     from collections import defaultdict
     by_file: Dict[str, List[str]] = defaultdict(list)
     for v in violations:
@@ -3827,17 +5490,12 @@ def print_human_output(output: Dict[str, Any]) -> None:
         control = v.get("policy_name") or v.get("control") or v.get("policy_id") or "(unknown)"
         by_file[file_].append(control)
 
-    num_files = len(by_file)
-    print(f"\n**{len(violations)} violation(s) across {num_files} file(s)**\n")
-
-    print("| File | Policy Violations |")
-    print("|------|-------------------|")
-
+    print(f"| File | {title} |")
+    print(f"|------|{'-' * (len(title) + 2)}|")
     for file_, controls in sorted(by_file.items()):
         numbered = "".join(f"{i}. {c}<br>" for i, c in enumerate(controls, 1))
         print(f"| `{file_}` | {numbered} |")
-
-    _print_uploaded_artifacts(output)
+    print()
 
 
 # GitHub caps a step summary at 1 MiB; keep each JSON well under half of that.
@@ -3845,29 +5503,27 @@ UPLOADED_JSON_SUMMARY_LIMIT = int(os.environ.get("UNIFAI_UPLOADED_JSON_SUMMARY_L
 
 
 def _print_uploaded_artifacts(output: Dict[str, Any]) -> None:
-    """Print the entities/findings JSON the server uploaded to Lineaje, verbatim."""
+    """One line saying what the server uploaded to Lineaje. The entities/findings JSON itself is printed
+    (and logged) only with UNIFAI_PRINT_UPLOADED_JSON=1 — by default it would bury the report and PR links."""
     artifacts = [
         ("entities.aientity.json", output.get("uploaded_entities") or []),
         ("findings.aifinding.json", output.get("uploaded_findings") or []),
     ]
     if not any(items for _, items in artifacts):
         return
-    print("\n### Uploaded to Lineaje\n")
     src = output.get("source_archive_s3_uploaded")
-    if src is False:
-        print(
-            "*Only these scan results were uploaded. The source code stayed on the "
-            "MCP host (hybrid mode) and was not uploaded.*\n"
-        )
-    elif src:
-        print("*The source archive was also uploaded to Lineaje (SaaS mode, or "
-              "UNIFAI_FORCE_S3_ARCHIVE_UPLOAD=true).*\n")
+    where = (" (scan results only; the source code stayed on the MCP host)" if src is False
+             else " (with the source archive)" if src else "")
+    print("\n**Uploaded to Lineaje:** " + ", ".join(f"`{name}` ({len(items)} item(s))" for name, items in artifacts)
+          + where + "\n")
+    if (os.environ.get("UNIFAI_PRINT_UPLOADED_JSON") or "").strip().lower() not in ("1", "true", "yes"):
+        return
     for name, items in artifacts:
         text = json.dumps(items, indent=2, default=str)
         truncated = len(text) > UPLOADED_JSON_SUMMARY_LIMIT
         if truncated:
             text = text[:UPLOADED_JSON_SUMMARY_LIMIT].rstrip() + "\n… (truncated)"
-        # Full copy always goes to the job log (stderr), even when the summary truncates.
+        # Full copy goes to the job log (stderr), even when the summary truncates.
         logger.info("Uploaded %s (%d item(s)):\n%s", name, len(items), json.dumps(items, indent=2, default=str))
         print(f"<details><summary><code>{name}</code> — {len(items)} item(s)"
               f"{' (truncated; full JSON in the job log)' if truncated else ''}</summary>\n")
@@ -4043,6 +5699,82 @@ def _reindent_from_body(replacement: str) -> str:
     return "\n".join([lines[0]] + [l[shift:] if l.strip() else l for l in lines[1:]])
 
 
+# Line-comment syntax per file type for code-fix suggestions: (prefix, suffix). A file
+# type missing here (JSON, …) cannot carry a suggestion and is left for a manual fix.
+_COMMENT_STYLES: Dict[str, Tuple[str, str]] = {
+    **{ext: ("# ", "") for ext in (".py", ".pyi", ".sh", ".bash", ".zsh", ".rb", ".pl", ".r", ".yaml", ".yml",
+                                   ".toml", ".cfg", ".ini", ".conf", ".tf", ".ps1", ".dockerfile", ".env")},
+    **{ext: ("// ", "") for ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".java", ".kt", ".kts", ".go",
+                                    ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".swift", ".rs", ".scala",
+                                    ".php", ".dart", ".groovy", ".gradle")},
+    **{ext: ("-- ", "") for ext in (".sql", ".lua", ".hs")},
+    **{ext: ("<!-- ", " -->") for ext in (".html", ".htm", ".xml", ".md", ".markdown", ".vue", ".svelte")},
+    **{ext: ("/* ", " */") for ext in (".css", ".scss", ".less")},
+}
+_SUGGESTION_MARKER = "LINEAJE UnifAI suggested fix"
+
+
+def _comment_style(rel_path: str) -> Optional[Tuple[str, str]]:
+    name = os.path.basename(rel_path).lower()
+    if name in ("dockerfile", "makefile") or name.startswith("dockerfile."):
+        return ("# ", "")
+    return _COMMENT_STYLES.get(os.path.splitext(name)[1])
+
+
+def _suggestion_lines(policy: str, explanation: str, replacement: str) -> List[str]:
+    """The suggestion as plain lines (no comment syntax): what to change and why, then the
+    suggested code, dedented, indented by four under the heading."""
+    lines = [f"{_SUGGESTION_MARKER} ({policy}) - not applied; review and apply by hand." if policy
+             else f"{_SUGGESTION_MARKER} - not applied; review and apply by hand."]
+    words, cur = (explanation or "").split(), ""
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > 100:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}" if cur else w
+    if cur:
+        lines.append(cur)
+    # A policy fix comment (no-LLM code-fix remediation) carries the instruction only.
+    if replacement.strip():
+        code = replacement.strip("\n").split("\n")
+        margin = min((len(l) - len(l.lstrip()) for l in code if l.strip()), default=0)
+        lines.append("Suggested replacement for the code below:")
+        lines.extend(("    " + l[margin:]).rstrip() for l in code)
+    lines.append("End of LINEAJE suggestion.")
+    return lines
+
+
+def _insert_fix_suggestion(
+    content: str, original: str, replacement: str, rel_path: str, check_python: bool,
+    policy: str = "", explanation: str = "",
+) -> Tuple[Optional[str], str]:
+    """(content with the suggestion inserted as comments above the code *original* quotes,
+    "") or (None, reason). The flagged code itself is left exactly as it is."""
+    span = _find_fix_span(content, original)
+    if span is None:
+        return None, "not found"
+    style = _comment_style(rel_path)
+    if style is None:
+        return None, "this file type has no comment syntax"
+    prefix, suffix = style
+    line_start = content.rfind("\n", 0, span[0]) + 1
+    line_end = content.find("\n", line_start)
+    line = content[line_start: line_end if line_end != -1 else len(content)]
+    indent = line[: len(line) - len(line.lstrip())]
+    body = [l.replace("-->", "-- >").replace("*/", "* /") if suffix else l
+            for l in _suggestion_lines(policy, explanation, replacement)]
+    block = "".join(f"{indent}{prefix}{l}{suffix}".rstrip() + "\n" for l in body)
+    if block in content:
+        return None, "already suggested"
+    patched = content[:line_start] + block + content[line_start:]
+    if check_python:
+        err = validate_python_source(patched, rel_path)
+        if err:
+            return None, err
+    return patched, ""
+
+
 def _apply_fix_entry_checked(
     content: str, original: str, replacement: str, rel_path: str, check_python: bool,
 ) -> Tuple[Optional[str], str]:
@@ -4202,6 +5934,100 @@ def _fix_entry_position(content: str, original: str) -> int:
     return -1
 
 
+# The harness route's two PR file sets (P5-10): whole-file versions over the scanned base.
+_HARNESS_PR_FILE_SETS = ("instrumentation_files", "code_fix_files")
+_PR_OVERLAP_WINDOW = 3
+
+
+def apply_code_fix_files_to_clone(
+    code_fix_files: Dict[str, str],
+    source_dir: str,
+    violations: List[Dict[str, Any]],
+) -> Tuple[Dict[str, str], List[str], List[Dict[str, str]]]:
+    """The code-fix PR of a harness scan: each file's comment-only version from the server
+    (``code_fix_files``, build-time comments above the flagged code, nothing else changed).
+
+    Returns (validated_fixes, failed_files, fix_table_rows), like ``apply_pipeline_fix_code_to_clone``.
+    """
+    validated: Dict[str, str] = {}
+    failed: List[str] = []
+    table: List[Dict[str, str]] = []
+    for rel in sorted(code_fix_files):
+        if _is_stub_or_env_file(rel):
+            continue
+        content = _checked_server_content(rel, code_fix_files[rel], source_dir)
+        if content is None:
+            failed.append(rel)
+            continue
+        validated[rel] = content
+        rows: List[Dict[str, str]] = []
+        seen: set = set()
+        for v in violations:
+            if _norm_stub_relpath(v.get("file") or v.get("file_path") or "") != rel or _is_intercept(v):
+                continue
+            policy = str(v.get("policy_name") or v.get("policy_id") or "").strip()
+            if policy in seen:
+                continue
+            seen.add(policy)
+            rows.append({"policy": policy or "build-time policy",
+                         "description": str(v.get("explanation") or "")[:200], "file": rel})
+        table.extend(rows or [{"policy": "build-time policy", "description": "", "file": rel}])
+    if validated or failed:
+        logger.info("STEP 3: %d file(s) with build-time suggested-fix comments, %d rejected",
+                    len(validated), len(failed))
+    return validated, failed, table
+
+
+def _changed_spans(base: str, new: str) -> List[Tuple[str, float, float]]:
+    """(tag, lo, hi) of each change of *new* against *base*, in base line numbers: an insertion sits at the
+    gap ``i + 0.5`` between base lines i and i + 1; a replacement / deletion covers lines ``lo..hi``."""
+    sm = difflib.SequenceMatcher(a=base.splitlines(), b=new.splitlines(), autojunk=False)
+    spans: List[Tuple[str, float, float]] = []
+    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "insert":
+            spans.append((tag, i1 + 0.5, i1 + 0.5))
+        else:
+            spans.append((tag, float(i1 + 1), float(i2)))
+    return spans
+
+
+def _pr_overlaps(
+    code_fix_files: Dict[str, str],
+    instrumentation_files: Dict[str, str],
+    source_dir: str,
+    window: int = _PR_OVERLAP_WINDOW,
+) -> List[Dict[str, Any]]:
+    """Places where a code-fix comment lands within *window* lines of a stub in the same base file —
+    the two PRs may then conflict when the second one merges (P5-10). Reported, never fatal."""
+    hits: List[Dict[str, Any]] = []
+    for rel in sorted(set(code_fix_files) & set(instrumentation_files)):
+        path = os.path.join(source_dir, *rel.split("/"))
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            base = fh.read()
+        stubs = _changed_spans(base, instrumentation_files[rel])
+        for _tag, c_lo, c_hi in _changed_spans(base, code_fix_files[rel]):
+            for _s_tag, s_lo, s_hi in stubs:
+                if max(s_lo - c_hi, c_lo - s_hi, 0.0) <= window:
+                    # both as "the base line the change sits above / starts at"
+                    hits.append({"file": rel, "comment_line": int(c_lo + 0.5), "stub_line": int(s_lo + 0.5)})
+    return hits
+
+
+def _pr_overlap_note(hits: List[Dict[str, Any]], other_kind: str) -> str:
+    """PR-body note for :func:`_pr_overlaps` hits (file names and line numbers only)."""
+    if not hits:
+        return ""
+    where = "; ".join(f"`{h['file']}` (comment above line {h['comment_line']}, stub at line {h['stub_line']})"
+                      for h in hits)
+    return (f"**Merge order.** The {other_kind} pull request from the same scan changes lines within "
+            f"{_PR_OVERLAP_WINDOW} lines of this one in: {where}. Merge one of the two first, then rebase (or "
+            "update the branch of) the other before merging it; Git may otherwise report a conflict there.")
+
+
 def apply_pipeline_fix_code_to_clone(
     remediation_actions: List[Dict[str, Any]],
     source_dir: str,
@@ -4264,8 +6090,10 @@ def apply_pipeline_fix_code_to_clone(
                     continue
                 original = fix_entry["original"]
                 replacement = fix_entry.get("replacement", "")
-                patched, reason = _apply_fix_entry_checked(
+                # The flagged code stays; the fix goes in above it as a comment.
+                patched, reason = _insert_fix_suggestion(
                     content, original, replacement, rel_path, check_python,
+                    action.get("control", ""), fix_entry.get("explanation", ""),
                 )
                 if patched is None:
                     if _round == 0 and reason == "not found":
@@ -4334,33 +6162,10 @@ def apply_pipeline_fix_code_to_clone(
 # LLM remediation — report / PR sections
 # ===========================================================================
 
-def _md_cell(text: Any, limit: int = 300) -> str:
-    t = " ".join(str(text or "").split())
-    if len(t) > limit:
-        t = t[: limit - 1].rstrip() + "…"
-    return t.replace("|", "\\|")
-
-
-def _pr_remediation_details(fix_table: List[Dict[str, str]], limit_chars: int) -> str:
-    """Compact per-file remediation list for the PR body (policy + what was changed)."""
-    if not fix_table:
-        return ""
-    lines = ["### Remediation details (LLM)", "", "| File | Policy | Change |", "|------|--------|--------|"]
-    for r in fix_table:
-        lines.append(
-            f"| `{_md_cell(r.get('file'), 100)}` | {_md_cell(r.get('policy'), 100)} | "
-            f"{_md_cell(r.get('description'), 200)} |"
-        )
-    text = "\n".join(lines)
-    if len(text) > limit_chars:
-        text = text[:limit_chars].rsplit("\n", 1)[0] + "\n\n*… more rows in the scan report.*"
-    return text
-
-
-
 _PR_REPORT_SECTIONS = (
     "### SECTION 1: AIBOM Discovery",
     "### SECTION 2: Policy Violations",
+    "### SECTION 2: Policy Intercepts",
     "### SECTION 3: Controls Enforced",
 )
 
@@ -4377,35 +6182,20 @@ def _build_fix_pr_body(
     scan_errors: Optional[List[str]] = None,
 ) -> str:
     """Remediation PR description: SECTION 1 (AIBOM), SECTION 2 (Policy Violations),
-    SECTION 3 (Controls Enforced) from the scan report, then the remediation changes.
+    SECTION 3 (Controls Enforced) from the scan report — nothing else.
 
-    The remediation part is sized first so a long report is what gets truncated, never
-    the list of changed files. ``scan_errors`` is accepted but not shown: the PR is
-    customer facing and a customer cannot act on them; they are logged as warnings
-    where each batch returns (C-38, session 11).
+    No "Remediation changes" / "Files remediated" list and no "Remediation details (LLM)"
+    table (user decision 2026-10-21): the PR's own diff shows what changed. ``committed``,
+    ``failed_files`` and ``fix_table`` are accepted for the callers' signature only.
+    ``scan_errors`` is accepted but not shown: the PR is customer facing and a customer
+    cannot act on them; they are logged as warnings where each batch returns (C-38, session 11).
     """
     head = "\n".join([
         "## Lineaje AI Policy Scan",
         "",
-        f"Scan of `{branch}` at `{sha_short}`. The remediation changes below are "
+        f"Scan of `{branch}` at `{sha_short}`. The changes in this pull request are "
         "LLM-suggested fixes for review — merge only what you accept.",
     ])
-    failed = failed_files or []
-    if failed:
-        # User decision (2026-10-05): when any flagged file has no fix, the PR does not
-        # list the files with and without fixes; the per-file details below remain.
-        remediation = "## Remediation changes"
-    else:
-        remediation = "\n".join([
-            "## Remediation changes",
-            "",
-            f"### Files remediated ({len(committed)})",
-            "",
-            "\n".join(f"- `{f}`" for f in committed),
-        ])
-    details = _pr_remediation_details(fix_table, limit // 3)
-    if details:
-        remediation += "\n\n" + details
 
     sections = _split_report_sections(report or "")
     blocks = [f"{h}\n{sections[h].strip()}" for h in _PR_REPORT_SECTIONS if sections.get(h, "").strip()]
@@ -4413,14 +6203,13 @@ def _build_fix_pr_body(
 
     sep = "\n\n---\n\n"
     note = f"\n\n{report_note}" if report_note else ""
-    budget = limit - len(head) - len(remediation) - 2 * len(sep) - len(note)
+    budget = limit - len(head) - len(sep) - len(note)
     parts = [head]
     if report_md and budget > 500:
         if len(report_md) > budget:
             cut = "\n\n*… report truncated — full report in the workflow run summary.*"
             report_md = report_md[: budget - len(cut)].rsplit("\n", 1)[0] + cut
         parts.append(report_md + note)
-    parts.append(remediation)
     return sep.join(parts)[:limit]
 
 
@@ -4526,6 +6315,26 @@ class _GitHubClient:
         })
         return resp["number"]
 
+    def find_open_pull_request(self, repo: str, base: str, head_prefix: str) -> Optional[Dict[str, Any]]:
+        """The newest open PR into *base* whose head branch (in this repo) starts with
+        *head_prefix*: ``{"number", "head", "head_sha"}``, or None."""
+        repo = _normalize_github_repo_slug(repo)
+        qbase = urllib.parse.quote(base, safe="")
+        pulls = self._request("GET", f"/repos/{repo}/pulls?state=open&base={qbase}&per_page=100") or []
+        mine = [p for p in pulls if isinstance(p, dict)
+                and str((p.get("head") or {}).get("ref") or "").startswith(head_prefix)
+                and ((p.get("head") or {}).get("repo") or {}).get("full_name", repo).lower() == repo.lower()]
+        if not mine:
+            return None
+        pr = max(mine, key=lambda p: int(p.get("number") or 0))
+        return {"number": int(pr["number"]), "head": pr["head"]["ref"], "head_sha": pr["head"].get("sha") or ""}
+
+    def update_pull_request(self, repo: str, number: int, *, title: str = "", body: str = "") -> None:
+        repo = _normalize_github_repo_slug(repo)
+        payload = {k: v for k, v in (("title", title), ("body", body)) if v}
+        if payload:
+            self._request("PATCH", f"/repos/{repo}/pulls/{number}", payload)
+
 
 def _is_guard_file(path: str) -> bool:
     return os.path.basename(path) in (_GUARD_FILENAME, "unifaiGuard.js", "unifaiGuard.cjs",
@@ -4566,8 +6375,11 @@ def _create_github_fix_pr(
     report: str = "",
     failed_files: Optional[List[str]] = None,
     scan_errors: Optional[List[str]] = None,
+    kind: str = "code_fix",
+    pr_note: str = "",
 ) -> Tuple[Optional[int], str]:
-    """Commit LLM remediation (fix_code) patches to a branch and open a PR on github.com."""
+    """Commit patches to a branch and open a PR on github.com: LLM remediation (fix_code)
+    for ``kind="code_fix"``, guardrail stubs for ``kind="instrumentation"``."""
     if not validated_fixes:
         return None, ""
 
@@ -4583,8 +6395,9 @@ def _create_github_fix_pr(
 
     safe_branch = re.sub(r"[^a-zA-Z0-9._/-]", "-", branch)
     sha_short = head_sha[:7]
-    timestamp = time.strftime("%m%d%H%M")
-    remediation_branch = f"{REMEDIATION_BRANCH_PREFIX}-{safe_branch.replace('/', '-')}-{sha_short}-{timestamp}"
+    timestamp = time.strftime("%m%d%H%M%S")
+    wording = _pr_wording(kind, branch, sha_short)
+    remediation_branch = f"{wording['prefix']}-{safe_branch.replace('/', '-')}-{sha_short}-{timestamp}"
 
     scm = _GitHubClient(token=github_token)
 
@@ -4594,12 +6407,22 @@ def _create_github_fix_pr(
         except Exception as exc:
             logger.warning("Could not resolve short SHA %s: %s", head_sha, exc)
 
-    try:
-        logger.info("Creating remediation branch %s from %s", remediation_branch, sha_short)
-        scm.create_branch(repo, remediation_branch, head_sha)
-    except Exception as exc:
-        logger.error("Failed to create/verify remediation branch: %s", exc)
-        return None, remediation_branch
+    # Every scan opens its own PR on a fresh branch — an open UnifAI PR from an earlier
+    # scan is left as is, not updated with this scan's changes.
+    existing_pr: Optional[Dict[str, Any]] = None
+    commit_base = head_sha
+    if existing_pr:
+        remediation_branch = existing_pr["head"]
+        commit_base = existing_pr.get("head_sha") or remediation_branch
+        logger.info("Open %s PR #%d (%s) exists for %s — adding this scan's changes to it",
+                    wording["label"], existing_pr["number"], remediation_branch, branch)
+    else:
+        try:
+            logger.info("Creating remediation branch %s from %s", remediation_branch, sha_short)
+            scm.create_branch(repo, remediation_branch, head_sha)
+        except Exception as exc:
+            logger.error("Failed to create/verify remediation branch: %s", exc)
+            return None, remediation_branch
 
     committed: List[str] = []
     not_committed: List[str] = []
@@ -4615,9 +6438,9 @@ def _create_github_fix_pr(
             not_committed.append(filepath)
             continue
         policies = ", ".join({r["policy"] for r in fix_table if r.get("file") == filepath}) or "policy violations"
-        message = f"fix({filepath}): remediate {policies} [unifai-ghp-scan]"
+        message = _pr_wording(kind, branch, sha_short, filepath, policies)["commit"] + " [unifai-ghp-scan]"
         try:
-            _commit_with_retry(scm, repo, remediation_branch, filepath, content, message, head_sha)
+            _commit_with_retry(scm, repo, remediation_branch, filepath, content, message, commit_base)
             committed.append(filepath)
             logger.info("Committed fix: %s", filepath)
         except Exception as exc:
@@ -4630,16 +6453,24 @@ def _create_github_fix_pr(
         logger.warning("No files committed — skipping PR creation")
         return None, remediation_branch
 
-    title = f"[unifai-bot] fix: AI policy remediation for {branch}@{sha_short}"
-    pr_body = _build_fix_pr_body(
+    title = wording["title"]
+    pr_body = wording["intro"] + (f"\n\n{pr_note}" if pr_note else "") + "\n\n" + _build_fix_pr_body(
         branch, sha_short, committed, list(failed_files or []) + not_committed,
         [r for r in fix_table if r.get("file") not in not_committed], report, GITHUB_PR_BODY_SAFE_LIMIT,
         scan_errors=scan_errors,
     )
 
+    if existing_pr:
+        try:
+            scm.update_pull_request(repo, existing_pr["number"], title=title, body=pr_body)
+        except Exception as exc:
+            logger.warning("Updated PR #%d's branch but not its description: %s", existing_pr["number"], exc)
+        logger.info("Updated %s PR #%d — https://github.com/%s/pull/%d",
+                    wording["label"], existing_pr["number"], repo, existing_pr["number"])
+        return existing_pr["number"], remediation_branch
     try:
         pr_number = scm.create_pull_request(repo, title, remediation_branch, branch, pr_body)
-        logger.info("Created remediation PR #%d — https://github.com/%s/pull/%d", pr_number, repo, pr_number)
+        logger.info("Created %s PR #%d — https://github.com/%s/pull/%d", wording["label"], pr_number, repo, pr_number)
         return pr_number, remediation_branch
     except Exception as exc:
         logger.error("Failed to create remediation PR: %s", exc)
@@ -4656,6 +6487,8 @@ def _create_fix_pr(
     report: str = "",
     failed_files: Optional[List[str]] = None,
     scan_errors: Optional[List[str]] = None,
+    kind: str = "code_fix",
+    pr_note: str = "",
 ) -> Tuple[Optional[int], str]:
     """Commit fix_code patches to a remediation branch and open a PR."""
     if not validated_fixes:
@@ -4663,8 +6496,9 @@ def _create_fix_pr(
 
     safe_branch = re.sub(r"[^a-zA-Z0-9._/-]", "-", branch)
     sha_short = head_sha[:7]
-    timestamp = time.strftime("%m%d%H%M")
-    remediation_branch = f"{REMEDIATION_BRANCH_PREFIX}-{safe_branch.replace('/', '-')}-{sha_short}-{timestamp}"
+    timestamp = time.strftime("%m%d%H%M%S")
+    wording = _pr_wording(kind, branch, sha_short)
+    remediation_branch = f"{wording['prefix']}-{safe_branch.replace('/', '-')}-{sha_short}-{timestamp}"
     if len(head_sha) < 40:
         resolved: Optional[str] = None
         try:
@@ -4676,19 +6510,33 @@ def _create_fix_pr(
             return None, ""
         head_sha = resolved
 
-    try:
-        logger.info("Creating remediation branch %s from %s", remediation_branch, sha_short)
-        scm.create_branch(remediation_branch, head_sha)
-    except Exception as exc:
-        logger.error("Failed to create remediation branch: %s", exc)
-        return None, remediation_branch
+    # Every scan opens its own PR on a fresh branch — an active UnifAI PR from an earlier
+    # scan is left as is, not updated with this scan's changes.
+    existing_pr: Optional[Dict[str, Any]] = None
+    push_base = head_sha
+    if existing_pr:
+        remediation_branch = existing_pr["head"]
+        push_base = scm.get_branch_sha(remediation_branch) or ""
+        if not push_base:
+            logger.error("Active PR !%d's branch %s has no tip; not updating it", existing_pr["number"],
+                         remediation_branch)
+            return None, remediation_branch
+        logger.info("Active %s PR !%d (%s) exists for %s — adding this scan's changes to it",
+                    wording["label"], existing_pr["number"], remediation_branch, branch)
+    else:
+        try:
+            logger.info("Creating remediation branch %s from %s", remediation_branch, sha_short)
+            scm.create_branch(remediation_branch, head_sha)
+        except Exception as exc:
+            logger.error("Failed to create remediation branch: %s", exc)
+            return None, remediation_branch
 
     # changeType is per file: everything patched here was read off the checkout,
     # so "edit" is the norm, but ask rather than assume.
     existing: Dict[str, bool] = {}
     for filepath in validated_fixes:
         try:
-            existing[filepath] = scm.file_exists(filepath, head_sha)
+            existing[filepath] = scm.file_exists(filepath, push_base)
         except Exception as exc:
             logger.debug("Existence check failed for %s (%s) — treating as edit", filepath, exc)
             existing[filepath] = True
@@ -4696,14 +6544,14 @@ def _create_fix_pr(
     committed = sorted(validated_fixes)
     policies = ", ".join(sorted({r["policy"] for r in fix_table if r.get("policy")})) or "policy violations"
     message = "\n".join(
-        [f"fix: remediate {policies} [unifai-ado-scan]", ""]
+        [_pr_wording(kind, branch, sha_short, "", policies)["commit"].replace("()", "") + " [unifai-ado-scan]", ""]
         + [f"- {f}" for f in committed]
     )
 
     try:
         scm.push_commit(
             remediation_branch,
-            head_sha,
+            push_base,
             {f: validated_fixes[f].encode("utf-8") for f in committed},
             message,
             existing=existing,
@@ -4713,14 +6561,22 @@ def _create_fix_pr(
         logger.error("Failed to push fixes to %s: %s", remediation_branch, exc)
         return None, remediation_branch
 
-    title = f"[unifai-bot] fix: AI policy remediation for {branch}@{sha_short}"
+    title = wording["title"]
 
-    pr_body = _build_fix_pr_body(
+    pr_body = wording["intro"] + (f"\n\n{pr_note}" if pr_note else "") + "\n\n" + _build_fix_pr_body(
         branch, sha_short, committed, failed_files, fix_table, report, AZURE_PR_DESCRIPTION_LIMIT,
         report_note="*Full scan report: see the `unifai-report` artifact on the pipeline run.*",
         scan_errors=scan_errors,
     )
 
+    if existing_pr:
+        try:
+            scm.update_pull_request(existing_pr["number"], title=title, description=pr_body)
+        except Exception as exc:
+            logger.warning("Updated PR !%d's branch but not its description: %s", existing_pr["number"], exc)
+        logger.info("Updated %s PR !%d — %s", wording["label"], existing_pr["number"],
+                    scm.pull_request_url(existing_pr["number"]))
+        return existing_pr["number"], remediation_branch
     try:
         pr_id = scm.create_pull_request(title, remediation_branch, branch, pr_body)
         logger.info("Created remediation PR !%d — %s", pr_id, scm.pull_request_url(pr_id))
@@ -4733,6 +6589,37 @@ def _create_fix_pr(
 # ===========================================================================
 # Main scan orchestration
 # ===========================================================================
+
+def _git_out(path: str, *args: str) -> str:
+    """``git -C path <args>`` stdout, stripped; "" when git or the repository is missing."""
+    try:
+        out = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=10)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _git_origin_url(path: str) -> str:
+    """The checkout's ``origin`` remote as an https URL without credentials or ``.git``
+    (``git@github.com:o/r.git`` and ``https://user:token@github.com/o/r.git`` both become
+    ``https://github.com/o/r``); "" when there is none."""
+    url = _git_out(path, "remote", "get-url", "origin")
+    if not url:
+        return ""
+    if url.startswith("git@") and ":" in url:
+        host, _, rest = url[len("git@"):].partition(":")
+        url = f"https://{host}/{rest}"
+    elif url.startswith(("ssh://", "git://")):
+        url = "https://" + url.split("://", 1)[1].split("@", 1)[-1].replace(":22/", "/")
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    host = parsed.netloc.rsplit("@", 1)[-1]
+    path_part = parsed.path.rstrip("/")
+    if path_part.endswith(".git"):
+        path_part = path_part[:-4]
+    return f"https://{host}{path_part}"
+
 
 def _azure_branch() -> str:
     """Short branch name from the agent's predefined variables.
@@ -4750,26 +6637,54 @@ def _azure_branch() -> str:
     return (os.environ.get("BUILD_SOURCEBRANCHNAME") or "").strip()
 
 
+def resolve_pr_mode(requested: Optional[str], github_token: str) -> str:
+    """--pr-mode / UNIFAI_PR_MODE when set; otherwise direct with a GitHub token (the runner opens the
+    PRs), explain without one (the Lineaje GPT service raises the PR)."""
+    mode = (requested or "").strip().lower()
+    if mode:
+        return mode
+    return "direct" if github_token else "explain"
+
+
 def _execute_scan(args: argparse.Namespace) -> int:
     org_url = args.org_url or os.environ.get("SYSTEM_TEAMFOUNDATIONCOLLECTIONURI", "")
     project = args.project or os.environ.get("SYSTEM_TEAMPROJECT", "")
     repo_name = args.repo or os.environ.get("BUILD_REPOSITORY_NAME", "")
     repo_id = args.repo_id or os.environ.get("BUILD_REPOSITORY_ID", "") or repo_name
-    branch = args.branch or _azure_branch()
-    head_sha = args.head_sha or os.environ.get("BUILD_SOURCEVERSION", "")
     source_path = os.path.abspath(args.source_path)
+    git_branch = _git_out(source_path, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = (args.branch or _azure_branch() or os.environ.get("GITHUB_REF_NAME", "")
+              or (git_branch if git_branch != "HEAD" else ""))
+    head_sha = (args.head_sha or os.environ.get("BUILD_SOURCEVERSION", "") or os.environ.get("GITHUB_SHA", "")
+                or _git_out(source_path, "rev-parse", "HEAD"))
     server_url = args.mcp_server_url or os.environ.get("MCP_SERVER_URL", "") or MCP_SERVER_URL
+    # --mcp-server-url picks the environment too: the token renew, SCIM and GPT service URLs follow it
+    os.environ["MCP_SERVER_URL"] = server_url
 
     repo = f"{project}/{repo_name}" if project and repo_name else (repo_name or project)
     source_code_repo = os.environ.get("BUILD_REPOSITORY_URI", "")
     if not source_code_repo:
-        if org_url and project and repo_name:
+        github_repo = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+        if github_repo:
+            # GitHub Actions: the clone URL, so the app purl is pkg:github/<owner>/<repo>
+            # (the checkout directory carries no owner).
+            github_server = (os.environ.get("GITHUB_SERVER_URL") or "https://github.com").rstrip("/")
+            source_code_repo = f"{github_server}/{github_repo}"
+        elif org_url and project and repo_name:
             source_code_repo = (
                 f"{org_url.rstrip('/')}/{urllib.parse.quote(project, safe='')}"
                 f"/_git/{urllib.parse.quote(repo_name, safe='')}"
             )
         else:
-            source_code_repo = source_path
+            # A local or CI checkout that still has .git knows its repository; then an
+            # owner/repo --repo (GitHub). The checkout directory is the last resort: it
+            # names no owner, so the app purl degrades to pkg:generic/<dir>.
+            source_code_repo = _git_origin_url(source_path) or (
+                f"https://github.com/{repo_name.strip('/')}" if repo_name.count("/") == 1 and not org_url else ""
+            ) or source_path
+            if source_code_repo == source_path:
+                logger.warning("No repository URL for %s (no origin remote, no --repo owner/name): the app "
+                               "purl will be pkg:generic/<directory>", source_path)
 
     # Validate config
     missing = [n for n, v in [
@@ -4817,6 +6732,9 @@ def _execute_scan(args: argparse.Namespace) -> int:
         print_human_output(output)
         return 0
 
+    _set_app_purl_headers(source_path, repo, head_sha, file_list,
+                          os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or "")
+
     batch_size = _batch_size(len(file_list))
     batches, code_files, manifest_files = pin_manifests_to_first_batch(file_list, batch_size)
     log_file_selection(batches, manifest_files, skipped_files)
@@ -4854,12 +6772,13 @@ def _execute_scan(args: argparse.Namespace) -> int:
         server_url=server_url,
         bearer_getter=bearer_getter,
         manifest_files=manifest_files or None,
+        sbom_id=getattr(args, "sbom_id", "") or "",
     )
 
     elapsed = time.perf_counter() - scan_start
     logger.info(
-        "Scan complete in %.1fs: %d violation(s), %d AIBOM entr(ies), %d failed batch(es)",
-        elapsed, len(all_violations), len(all_aibom), failed_batches_count,
+        "Scan complete in %.1fs: %s, %d AIBOM entr(ies), %d failed batch(es)",
+        elapsed, _findings_label(all_violations), len(all_aibom), failed_batches_count,
     )
 
     combined_report = _merge_batch_reports(
@@ -4867,7 +6786,9 @@ def _execute_scan(args: argparse.Namespace) -> int:
         total_violations=len(all_violations),
         total_remediation_actions=len(all_remediation_actions),
         total_elapsed=elapsed,
+        total_intercepts=sum(1 for v in all_violations if _is_intercept(v)),
     )
+    combined_report = _split_intercepts_in_report(combined_report, all_violations)
 
     if failed_batches_count and not all_violations:
         output = build_json_output(
@@ -4894,12 +6815,20 @@ def _execute_scan(args: argparse.Namespace) -> int:
     validated_fixes: Dict[str, str] = {}
     fix_table: List[Dict[str, str]] = []
 
-    if all_stub_insertions:
-        logger.info(
-            "STEP 3: ignoring %d guardrail stub insertion(s) — this script applies LLM remediation only",
-            len(all_stub_insertions),
-        )
-    rem_actions = [a for a in all_remediation_actions if not _is_stub_or_env_file(a.get("file") or "")]
+    # Guardrail stubs (instrumentation) go to their own pull request, raised after the
+    # code-fix one below: instrumentation is not a fix and is reviewed differently.
+    # Code-fix PR: only changes whose fix_type is a code fix (CODE_FIX_TYPES: code-fix / code-insert, today
+    # "Do not store secrets in code"). Same rule as the report (_is_intercept): intercept, any other value and an
+    # untagged action are intercepts — an older server that sends runtime-guardrail actions without fix_type
+    # ("Mask PII on user interfaces") must not get them committed as code changes.
+    rem_actions = [a for a in all_remediation_actions
+                   if not _is_stub_or_env_file(a.get("file") or "") and not _is_intercept(a)]
+    _held_back = [a for a in all_remediation_actions
+                  if not _is_stub_or_env_file(a.get("file") or "") and _is_intercept(a)]
+    if _held_back:
+        logger.info("STEP 3: %d intercept action(s) kept out of the code-fix PR (untagged or fix_type=intercept): %s",
+                    len(_held_back), ", ".join(sorted({f"{a.get('file')} [{a.get('control') or a.get('policy_id')}]"
+                                                       for a in _held_back})))
     if rem_actions:
         logger.info("STEP 3: applying LLM remediation (%d action(s))", len(rem_actions))
         validated_fixes, failed_rem_files, fix_table = apply_pipeline_fix_code_to_clone(
@@ -4911,6 +6840,14 @@ def _execute_scan(args: argparse.Namespace) -> int:
         )
     else:
         logger.info("STEP 3: server returned no LLM remediation (remediation_actions is empty)")
+    pr_sets = uploaded.get("pr_file_sets")
+    if pr_sets is not None and pr_sets.get("code_fix_files"):
+        cf_fixes, cf_failed, cf_table = apply_code_fix_files_to_clone(
+            pr_sets["code_fix_files"], source_path, all_violations)
+        for rel, content in cf_fixes.items():
+            validated_fixes.setdefault(rel, content)
+        fix_table.extend(row for row in cf_table if row["file"] in cf_fixes)
+        failed_rem_files.extend(cf_failed)
 
     # GitHub token takes precedence over Azure DevOps config.
     github_token = _normalize_token(
@@ -4925,7 +6862,56 @@ def _execute_scan(args: argparse.Namespace) -> int:
         or os.environ.get("AZURE_DEVOPS_PAT", "")
     )
     use_github = bool(github_token)
-    should_create_pr = bool((github_token or azure_token) and getattr(args, "create_fix_pr", False))
+    # direct: this script pushes the branches and opens the remediation and instrumentation PRs itself with
+    # the GitHub / Azure token, and nothing goes through /explain. explain: this script asks the Lineaje GPT
+    # service to raise the PR, the FM scanner way (/explain: fix plan -> apply fix left plan) — no SCM token
+    # needed on this runner. mcp: the MCP server sends only "Apply fix left plan" (lineaje_create_fix_pr).
+    pr_mode = resolve_pr_mode(getattr(args, "pr_mode", None) or os.environ.get("UNIFAI_PR_MODE", ""), github_token)
+    via_explain = pr_mode in ("explain", "mcp")
+    should_create_pr = bool(getattr(args, "create_fix_pr", False) and (via_explain or github_token or azure_token))
+    if getattr(args, "create_fix_pr", False) and pr_mode == "direct" and not should_create_pr:
+        logger.warning("--pr-mode direct: no GitHub / Azure DevOps token (--github-token, $GH_TOKEN, $GITHUB_TOKEN, "
+                       "--azure-token, ...) — no PR is created")
+    remediation_task_ids: List[str] = []
+    instrumentation_task_ids: List[str] = []
+
+    def _request_pr_via_gpt_explain() -> List[str]:
+        """One PR request per scan: the plan covers every fix of the sbom (code-fix and
+        instrumented), so asking twice would raise the same PR twice."""
+        sbom_id = uploaded.get("sbom_id") or ""
+        if not sbom_id:
+            logger.warning("Skipping the fix PR — the scan returned no sbom_id to raise it against")
+            return []
+        gpt_url = (getattr(args, "gpt_service_url", None) or os.environ.get("LINEAJE_GPT_SERVICE_URL", "")
+                   or _default_gpt_service_url()).strip()
+        try:
+            res = request_fix_pr_via_explain(
+                gpt_url, bearer_getter, source_code_repo, branch, sbom_id,
+                head_sha=head_sha, run_id=uploaded.get("run_id") or "",
+                product_id=os.environ.get("LINEAJE_PRODUCT_ID", ""),
+            )
+        except Exception as exc:
+            logger.error("Fix PR request failed: %s", _describe_exception(exc))
+            return []
+        logger.info("Fix PR: %s", res.get("message"))
+        return list(res.get("task_ids") or [])
+
+    def _request_pr_via_explain(fix_type: str, files: Sequence[str]) -> List[str]:
+        sbom_id = uploaded.get("sbom_id") or ""
+        if not sbom_id:
+            logger.warning("Skipping %s PR — the scan returned no sbom_id to raise it against", fix_type)
+            return []
+        try:
+            res = request_fix_pr_via_mcp(
+                server_url, bearer_getter, source_code_repo, branch, sbom_id,
+                head_sha=head_sha, run_id=uploaded.get("run_id") or "", fix_type=fix_type, files=files,
+            )
+        except Exception as exc:
+            logger.error("%s PR request failed: %s", fix_type, _describe_exception(exc))
+            return []
+        logger.info("%s", res.get("message") or res)
+        return [str(t) for t in (res.get("task_ids") or []) if t]
+
     missing_scm: List[str] = []
     if should_create_pr and not use_github:
         missing_scm = [n for n, v in [
@@ -4946,13 +6932,43 @@ def _execute_scan(args: argparse.Namespace) -> int:
         ]
     failed_rem_files.extend(_add_shared_guard_files(validated_fixes, source_path, fix_table))
 
+    # Harness mode (P5-10): both PRs are whole-file versions over the same base, so each applies on its own;
+    # a code-fix comment within a few lines of a stub may conflict when the second PR merges — say so in both.
+    harness_stub_fixes: Optional[Dict[str, str]] = None
+    harness_stub_dropped: List[str] = []
+    fix_pr_extra: Dict[str, str] = {}
+    inst_pr_extra: Dict[str, str] = {}
+    if pr_sets is not None:
+        harness_stub_fixes = (apply_stub_insertions_to_clone(all_stub_insertions, source_path)
+                              if all_stub_insertions else {})
+        harness_stub_dropped = _drop_uncompilable_fixes(harness_stub_fixes)
+        shared = sorted(set(validated_fixes) & set(harness_stub_fixes))
+        if shared:
+            logger.info("Code-fix and instrumentation PRs both change %d file(s), each with its own version: %s",
+                        len(shared), ", ".join(shared))
+        overlaps = _pr_overlaps(validated_fixes, harness_stub_fixes, source_path)
+        for hit in overlaps:
+            logger.warning("PR overlap: %s — suggested-fix comment above line %d is within %d lines of a stub "
+                           "at line %d (the two PRs may conflict)", hit["file"], hit["comment_line"],
+                           _PR_OVERLAP_WINDOW, hit["stub_line"])
+        if overlaps:
+            fix_pr_extra = {"pr_note": _pr_overlap_note(overlaps, "instrumentation")}
+            inst_pr_extra = {"pr_note": _pr_overlap_note(overlaps, "code-fix")}
+
     fix_branch_name = (getattr(args, "fix_branch", None) or "").strip()
     if fix_branch_name:
         local_branch = commit_fixes_to_local_branch(source_path, fix_branch_name, validated_fixes)
         if local_branch and not remediation_branch:
             remediation_branch = local_branch
 
-    if should_create_pr and use_github:
+    if should_create_pr and pr_mode == "explain":
+        pass  # one /explain request after STEP 4, covering the stubs too
+    elif should_create_pr and via_explain:
+        if validated_fixes:
+            remediation_task_ids = _request_pr_via_explain("code-insert", sorted(validated_fixes))
+        else:
+            logger.info("No LLM remediation patches to raise a remediation PR for")
+    elif should_create_pr and use_github:
         if validated_fixes:
             logger.info("Creating remediation PR on GitHub (%d file(s))", len(validated_fixes))
             try:
@@ -4960,7 +6976,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
                     github_token, repo, branch, head_sha,
                     validated_fixes, fix_table,
                     report=combined_report, failed_files=failed_rem_files,
-                    scan_errors=failure_details,
+                    scan_errors=failure_details, **fix_pr_extra,
                 )
                 if remediation_pr_number:
                     remediation_pr_url = (
@@ -4986,7 +7002,7 @@ def _execute_scan(args: argparse.Namespace) -> int:
                 branch, head_sha,
                 validated_fixes, fix_table,
                 report=combined_report, failed_files=failed_rem_files,
-                scan_errors=failure_details,
+                scan_errors=failure_details, **fix_pr_extra,
             )
             if remediation_pr_number:
                 remediation_pr_url = AzureDevOpsClient(
@@ -4996,6 +7012,81 @@ def _execute_scan(args: argparse.Namespace) -> int:
             logger.error("Remediation PR failed: %s", exc)
     elif should_create_pr:
         logger.info("No LLM remediation patches to commit for a remediation PR")
+
+    # Step 4: instrumentation PR — the server's guardrail stubs, gr_stub_client.py and
+    # patched files, in a pull request of their own (never merged automatically).
+    instrumentation_pr_number: Optional[int] = None
+    instrumentation_branch = ""
+    instrumentation_pr_url = ""
+    stub_fixes: Dict[str, str] = {}
+    if all_stub_insertions:
+        if harness_stub_fixes is not None:
+            stub_fixes, dropped = harness_stub_fixes, harness_stub_dropped
+        else:
+            stub_fixes = apply_stub_insertions_to_clone(all_stub_insertions, source_path)
+            dropped = _drop_uncompilable_fixes(stub_fixes)
+        if stub_fixes:
+            # .env.example: endpoints and an empty LINEAJE_REFRESH_TOKEN= for the customer to fill in (no
+            # credential is minted); what every stub shares goes once into gr_stub_client.py's SCAN_CONTEXT.
+            _ensure_env_example_in_validated_fixes(stub_fixes, source_path, server_url=server_url)
+            _stamp_scan_context(stub_fixes, _stub_scan_context(all_stub_insertions, branch))
+        stub_table = [
+            {
+                "policy": ", ".join(sorted({pd.get("policy_id", "") for pd in (s.get("policy_details") or [])
+                                            if pd.get("policy_id")})) or "runtime guardrail",
+                "description": (s.get("description") or "")[:200],
+                "file": _norm_stub_relpath(s.get("file") or ""),
+            }
+            for s in all_stub_insertions
+            if _norm_stub_relpath(s.get("file") or "") in stub_fixes
+        ]
+        logger.info("STEP 4: %d file(s) instrumented with guardrail stubs%s", len(stub_fixes),
+                    f" ({len(dropped)} dropped: do not compile)" if dropped else "")
+        if should_create_pr and stub_fixes and pr_mode == "explain":
+            pass  # raised with the remediation fixes below
+        elif should_create_pr and stub_fixes and via_explain:
+            instrumentation_task_ids = _request_pr_via_explain("instrumented", sorted(stub_fixes))
+        elif should_create_pr and stub_fixes:
+            try:
+                if use_github:
+                    instrumentation_pr_number, instrumentation_branch = _create_github_fix_pr(
+                        github_token, repo, branch, head_sha, stub_fixes, stub_table,
+                        report=combined_report, failed_files=dropped, scan_errors=failure_details,
+                        kind="instrumentation", **inst_pr_extra,
+                    )
+                    if instrumentation_pr_number:
+                        instrumentation_pr_url = (f"https://github.com/{_normalize_github_repo_slug(repo)}"
+                                                  f"/pull/{instrumentation_pr_number}")
+                elif not missing_scm:
+                    ado = AzureDevOpsClient(token=azure_token, org_url=org_url, project=project, repository=repo_id)
+                    instrumentation_pr_number, instrumentation_branch = _create_fix_pr(
+                        ado, branch, head_sha, stub_fixes, stub_table,
+                        report=combined_report, failed_files=dropped, scan_errors=failure_details,
+                        kind="instrumentation", **inst_pr_extra,
+                    )
+                    if instrumentation_pr_number:
+                        instrumentation_pr_url = ado.pull_request_url(instrumentation_pr_number)
+            except Exception as exc:
+                logger.error("Instrumentation PR failed: %s", exc)
+
+    # direct opened the PRs from this runner with the GitHub / Azure token and stops there: an /explain "Apply fix
+    # left plan" would have the platform raise the same fixes as PRs of its own.
+    if should_create_pr and pr_mode == "explain":
+        if validated_fixes or stub_fixes:
+            logger.info("STEP 5: fix PR through Lineaje /explain (%d remediated, %d instrumented file(s))",
+                        len(validated_fixes), len(stub_fixes))
+            remediation_task_ids = _request_pr_via_gpt_explain()
+        else:
+            logger.info("No remediation or instrumentation changes to raise a fix PR for")
+
+    # Every guardrail stub inserted is an intercept (counted per stub site, with the
+    # policies it enforces) — intercept policies are not evaluated, so their stubs have
+    # no finding behind them.
+    intercepts = _stub_intercepts(all_stub_insertions, stub_fixes, all_violations)
+    if intercepts and status == "compliant":
+        status = "violations_found"
+    if intercepts:
+        combined_report = re.sub(r"intercepts=\d+", f"intercepts={len(intercepts)}", combined_report, count=1)
 
     output = build_json_output(
         status=status, repo=repo, branch=branch, head_sha=head_sha,
@@ -5012,6 +7103,15 @@ def _execute_scan(args: argparse.Namespace) -> int:
         uploaded_findings=uploaded["findings"],
         source_archive_s3_uploaded=uploaded["source_archive_s3_uploaded"],
     )
+    output["instrumentation_pr"] = instrumentation_pr_number
+    output["instrumentation_branch"] = instrumentation_branch
+    output["instrumentation_pr_url"] = instrumentation_pr_url
+    output["instrumented_files"] = sorted(stub_fixes)
+    output["intercepts"] = intercepts
+    output["pr_mode"] = pr_mode
+    output["sbom_id"] = uploaded.get("sbom_id") or ""
+    output["remediation_task_ids"] = remediation_task_ids
+    output["instrumentation_task_ids"] = instrumentation_task_ids
     print_human_output(output)
     return 0
 
@@ -5062,6 +7162,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Commit id (default: $BUILD_SOURCEVERSION)",
     )
     parser.add_argument(
+        "--sbom-id", default="",
+        help="Scan under this existing sbom_id (SPDXRef-DOCUMENT-...) instead of letting the "
+             "server resolve or create one (the SQS processor passes input.json's sbom_id).",
+    )
+    parser.add_argument(
         "--mcp-server-url", default="",
         help=f"MCP server URL (default: {MCP_SERVER_URL})",
     )
@@ -5081,6 +7186,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--create-fix-pr", default=False, action="store_true",
         help="Create a remediation PR with fix_code patches (default: false).",
+    )
+    parser.add_argument(
+        "--pr-mode", default=None, choices=("explain", "mcp", "direct"),
+        help="How --create-fix-pr raises the PR (default: $UNIFAI_PR_MODE, else direct when a GitHub "
+             "token is set, else explain): explain calls the "
+             "Lineaje GPT service /explain ('Recommend a fix plan', polled every 20s up to 20 "
+             "times -> 'Apply fix left plan'); the platform creates the remediation task and its "
+             "executor opens one PR with every fix of the scan. direct pushes the branches and "
+             "opens the remediation and instrumentation PRs from this runner with "
+             "--github-token / --azure-token (GitHub: $GH_TOKEN, then $GITHUB_TOKEN); nothing goes "
+             "through /explain. mcp asks the MCP server to send only 'Apply fix "
+             "left plan' (lineaje_create_fix_pr).",
+    )
+    parser.add_argument(
+        "--gpt-service-url", default="",
+        help=f"Lineaje GPT service for --pr-mode explain (default: $LINEAJE_GPT_SERVICE_URL, "
+             f"then {GPT_SERVICE_URL})",
     )
     parser.add_argument(
         "--fix-branch", default=None, metavar="NAME",
