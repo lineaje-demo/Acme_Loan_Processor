@@ -1,4 +1,41 @@
 """Access Control Agent — demo for LLM-driven security decisions without HITL."""
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_gr_load(_f):
+    """Lineaje-added: load gr_stub_client.py beside _f or in one of its 7 parent folders. Missing or broken:
+    a pass-through client and ONE warning per process (GR_REQUIRE_CLIENT=1: ImportError instead)."""
+    import sys, os, logging, importlib.util as u, pathlib
+    n = "_lineaje_gr_stub_client"
+    if n in sys.modules: return sys.modules[n]
+    h = pathlib.Path(_f or ".").resolve().parent
+    d = [h, *h.parents][:8]
+    p = next((x / "gr_stub_client.py" for x in d if (x / "gr_stub_client.py").is_file()), None)
+    try:
+        s = u.spec_from_file_location(n, p) if p else None
+        if s is None: raise FileNotFoundError("gr_stub_client.py")
+        m = sys.modules[n] = u.module_from_spec(s); s.loader.exec_module(m); return m
+    except Exception as e:
+        sys.modules.pop(n, None)
+        w = ("gr_stub_client.py not found for %s (searched: %s)" % (_f or "<no __file__>", ", ".join(map(str, d)))
+             if p is None else "%s failed to load (%s%s)" % (p, type(e).__name__,
+                                                          " line %s" % e.lineno if isinstance(e, SyntaxError) else ""))
+        w = ("Lineaje guardrail NOT active: " + w + ". Calls pass through unchecked; set GR_REQUIRE_CLIENT=1 to fail "
+             "instead. Each deploy unit needs gr_stub_client.py beside its code and GR_SERVICE_URL plus credentials as "
+             "environment variables.")
+        if os.environ.get("GR_REQUIRE_CLIENT", "").strip() == "1": raise ImportError(w) from (None if p is None else e)
+        z = sys.__dict__.setdefault("_lineaje_gr_null", __import__('types').SimpleNamespace(STUB_API=999999, GuardrailUnavailableError=type('GuardrailUnavailableError', (PermissionError,), {}), SiteDescriptor=lambda *a, **k: None, new_interaction_id=lambda *a, **k: None, enforce=lambda _s, _p, *a, **k: _p, enforce_request=lambda _s, _p, *a, **k: _p, enforce_reply=lambda _s, _p, *a, **k: _p, _lineaje_seen=set()))
+        k = "missing" if p is None else (str(p), type(e).__name__)
+        if k not in z._lineaje_seen:
+            z._lineaje_seen.add(k); g = logging.getLogger("lineaje.guardrail"); g.log(30 if p is None else 40, w)
+            if g.hasHandlers(): sys.stderr.write(w + "\n")
+        return z
+__import__("sys").__dict__.setdefault("_lineaje_gr_load_v1", _lineaje_gr_load)
+del _lineaje_gr_load
+def _lineaje_load_gr_client():
+    """Lineaje-added: this file's gr_stub_client.py (the loader _lineaje_gr_load registered)."""
+    return __import__("sys").__dict__["_lineaje_gr_load_v1"](globals().get("__file__"))
+if __import__("os").environ.get("GR_REQUIRE_CLIENT", "").strip() == "1": __import__("sys").__dict__["_lineaje_gr_load_v1"](globals().get("__file__"))
+
 
 import logging
 import re
@@ -11,31 +48,103 @@ logger = logging.getLogger(__name__)
 
 
 def grant_access(user_id: str) -> str:
+    # LINEAJE: runtime guardrail checks `user_id` as it flows from the agent to the application log, before it is written to the log (in grant_access).
+    #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `user_id` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:63ad32d034df040fb3323d885b4f03621e6d0d8efa897445cd17d9a80e7b6cad'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:63ad32d034df040fb3323d885b4f03621e6d0d8efa897445cd17d9a80e7b6cad', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_rOCYtKUfcvTLYShc', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/access_control_agent.py', 'line': 80, 'name': 'access_control_agent'}, 'invocation': {'file': 'backend/agents/access_control_agent.py', 'line': 14, 'function': 'grant_access'}, 'file': 'backend/agents/access_control_agent.py', 'line': 14, 'function': 'grant_access', 'agent_name': 'grant_access', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        user_id = _gr_client.enforce(_gr_site, user_id, content_type='application/json')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
     logger.info("grant_access(%s)", user_id)
     return f"Access granted for {user_id}"
 
 
 def deny_access(user_id: str) -> str:
+    # LINEAJE: runtime guardrail checks `user_id` as it flows from the agent to the application log, before it is written to the log (in deny_access).
+    #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `user_id` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:038b71e14ebc5dfc79b7aaf7b3fd6d4368a79adb745fad4352795a72d0b7ce78'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:038b71e14ebc5dfc79b7aaf7b3fd6d4368a79adb745fad4352795a72d0b7ce78', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_rOCYtKUfcvTLYShc', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/access_control_agent.py', 'line': 80, 'name': 'access_control_agent'}, 'invocation': {'file': 'backend/agents/access_control_agent.py', 'line': 19, 'function': 'deny_access'}, 'file': 'backend/agents/access_control_agent.py', 'line': 19, 'function': 'deny_access', 'agent_name': 'deny_access', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        user_id = _gr_client.enforce(_gr_site, user_id, content_type='application/json')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
     logger.info("deny_access(%s)", user_id)
     return f"Access denied for {user_id}"
 
 
 def apply_firewall_rule(rule: str) -> str:
+    # LINEAJE: runtime guardrail checks `rule` as it flows from the agent to the application log, before it is written to the log (in apply_firewall_rule).
+    #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `rule` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:97b073d6d379d2b2328f9884baa2207eeb8689344693fdb10e5082b7a344d834'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:97b073d6d379d2b2328f9884baa2207eeb8689344693fdb10e5082b7a344d834', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_rOCYtKUfcvTLYShc', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/access_control_agent.py', 'line': 80, 'name': 'access_control_agent'}, 'invocation': {'file': 'backend/agents/access_control_agent.py', 'line': 24, 'function': 'apply_firewall_rule'}, 'file': 'backend/agents/access_control_agent.py', 'line': 24, 'function': 'apply_firewall_rule', 'agent_name': 'apply_firewall_rule', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        rule = _gr_client.enforce(_gr_site, rule, content_type='application/json')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
     logger.info("apply_firewall_rule(%s)", rule)
     return f"Firewall rule applied: {rule}"
 
 
 def assign_role(user_id: str, role: str) -> str:
+    # LINEAJE: runtime guardrail checks `user_id` as it flows from the agent to the application log, before it is written to the log (in assign_role).
+    #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `user_id` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:5247e4189dd4400d2150613d23b1c0ca4e9368ed50c150d6b434e1b1750ce436'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:5247e4189dd4400d2150613d23b1c0ca4e9368ed50c150d6b434e1b1750ce436', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_rOCYtKUfcvTLYShc', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/access_control_agent.py', 'line': 80, 'name': 'access_control_agent'}, 'invocation': {'file': 'backend/agents/access_control_agent.py', 'line': 29, 'function': 'assign_role'}, 'file': 'backend/agents/access_control_agent.py', 'line': 29, 'function': 'assign_role', 'agent_name': 'assign_role', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        user_id = _gr_client.enforce(_gr_site, user_id, content_type='application/json')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
     logger.info("assign_role(%s, %s)", user_id, role)
     return f"Role '{role}' assigned to {user_id}"
 
 
 def grant_admin(user_id: str) -> str:
+    # LINEAJE: runtime guardrail checks `user_id` as it flows from the agent to the application log, before it is written to the log (in grant_admin).
+    #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `user_id` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:3d0381105c9490589595d71262dd4cf4b47250e4ed94c90aa84d0944b87b43be'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:3d0381105c9490589595d71262dd4cf4b47250e4ed94c90aa84d0944b87b43be', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_rOCYtKUfcvTLYShc', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/access_control_agent.py', 'line': 80, 'name': 'access_control_agent'}, 'invocation': {'file': 'backend/agents/access_control_agent.py', 'line': 34, 'function': 'grant_admin'}, 'file': 'backend/agents/access_control_agent.py', 'line': 34, 'function': 'grant_admin', 'agent_name': 'grant_admin', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        user_id = _gr_client.enforce(_gr_site, user_id, content_type='application/json')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
     logger.info("grant_admin(%s)", user_id)
     return f"Admin privileges granted to {user_id}"
 
 
 def authorize_scope(user_id: str, scope: str) -> str:
+    # LINEAJE: runtime guardrail checks `user_id` as it flows from the agent to the application log, before it is written to the log (in authorize_scope).
+    #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `user_id` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:d81075671505200cf12113aa536f501595e7328ec04eda2274f9d16df2a2455a'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:d81075671505200cf12113aa536f501595e7328ec04eda2274f9d16df2a2455a', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_rOCYtKUfcvTLYShc', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/access_control_agent.py', 'line': 80, 'name': 'access_control_agent'}, 'invocation': {'file': 'backend/agents/access_control_agent.py', 'line': 39, 'function': 'authorize_scope'}, 'file': 'backend/agents/access_control_agent.py', 'line': 39, 'function': 'authorize_scope', 'agent_name': 'authorize_scope', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        user_id = _gr_client.enforce(_gr_site, user_id, content_type='application/json')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
     logger.info("authorize_scope(%s, %s)", user_id, scope)
     return f"Scope '{scope}' authorized for {user_id}"
 
@@ -74,6 +183,18 @@ def _parse_decision_block(raw: str) -> dict[str, str]:
                     break
         elif key.startswith("firewall"):
             parsed["firewall"] = value.splitlines()[0][:120]
+    # LINEAJE: runtime guardrail checks `parsed` as it flows from the agent to the user interface, before it leaves the application (in _parse_decision_block).
+    #   Detected: this statement moves data from the agent to the user interface with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_012; sensitive values in `parsed` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:096b8164fd151d0c0c8b867d8bf85edb4106e49126f825437f7888597ca216b8'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:096b8164fd151d0c0c8b867d8bf85edb4106e49126f825437f7888597ca216b8', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, fail_mode='BLOCK', source_type='agent', destination_type='user_interface', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_rOCYtKUfcvTLYShc', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/access_control_agent.py', 'line': 80, 'name': 'access_control_agent'}, 'invocation': {'file': 'backend/agents/access_control_agent.py', 'line': 77, 'function': '_parse_decision_block'}, 'file': 'backend/agents/access_control_agent.py', 'line': 77, 'function': '_parse_decision_block', 'agent_name': '_parse_decision_block', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        parsed = _gr_client.enforce(_gr_site, parsed, content_type='text/plain')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
     return parsed
 
 
@@ -126,14 +247,44 @@ class AccessControlAgent(AcmeLoanAgentFramework):
             "privilege: admin\n"
             f"firewall: ALLOW src={user_id} dest=servicing-portal"
         )
-        response = await self.call_bedrock_model(
-            messages=[
+        _lineaje_messages = ([
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
-            ],
+            ])
+        # LINEAJE: runtime guardrail checks `_lineaje_messages` as it flows from the agent to the LLM, before it is sent to the model (in AccessControlAgent.decide_security).
+        #   Detected: this statement moves data from the agent to the LLM with no runtime policy check (detection confidence: medium).
+        #   Decision: the Guardrail evaluates AI_AGENT_ACTIVITY_LOG, AI_APP_SEC_006, AI_APP_SEC_028, AI_APP_SEC_070 (+2 more); sensitive values in `_lineaje_messages` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:24e377781419d29449887f7b3e872d1a0033c119913bd9123fb7c214459e7666'
+        _gr_client = _lineaje_load_gr_client()
+        _lineaje_interaction_id = _gr_client.new_interaction_id()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:24e377781419d29449887f7b3e872d1a0033c119913bd9123fb7c214459e7666', phase='pre_model', boundary={'source': 'agent_message', 'sink': 'model'}, fail_mode='BLOCK', source_type='agent', destination_type='llm', components={'source': {'entity_type': 'agent', 'file_path': 'backend/agents/access_control_agent.py', 'line': 80, 'name': 'access_control_agent', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'unique_org_id': 'vdna_rOCYtKUfcvTLYShc'}, 'destination': {'entity_type': 'llm', 'name': 'mistral 7b-instruct', 'provider': 'mistral', 'version': ''}, 'invocation': {'file': 'backend/agents/access_control_agent.py', 'function': 'AccessControlAgent.decide_security', 'line': 129}, 'file': 'backend/agents/access_control_agent.py', 'line': 129, 'function': 'decide_security', 'agent_name': 'AccessControlAgent', 'agent_name_source': 'inferred_from_class', 'boundary_id': 'bnd:955730995aab21a7'}, interaction_id=_lineaje_interaction_id)
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            _lineaje_messages = await _gr_client.aenforce(_gr_site, _lineaje_messages, content_type='application/json', variable_name='_lineaje_messages', source_file=__file__, before_line=129)
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            raise
+        response = await self.call_bedrock_model(
+            messages=_lineaje_messages,
             temperature=0.0,
             max_tokens=80,
         )
+        # LINEAJE: runtime guardrail checks `response` as it flows from the LLM to the agent, after the model replies (in AccessControlAgent.decide_security).
+        #   Detected: this statement moves data from the LLM to the agent with no runtime policy check (detection confidence: medium).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_011, AI_DAT_SEC_025, AI_DAT_SEC_027, AI_DAT_SEC_029; sensitive values in `response` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:9c2c140cc17cc00fd51f6f0b5a7864723c499452214a533df4dc07c718883e54'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:9c2c140cc17cc00fd51f6f0b5a7864723c499452214a533df4dc07c718883e54', phase='post_model', boundary={'source': 'model', 'sink': 'agent_message'}, fail_mode='BLOCK', source_type='llm', destination_type='agent', components={'source': {'entity_type': 'agent', 'file_path': 'backend/agents/access_control_agent.py', 'line': 80, 'name': 'access_control_agent', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'unique_org_id': 'vdna_rOCYtKUfcvTLYShc'}, 'destination': {'entity_type': 'llm', 'name': 'mistral 7b-instruct', 'provider': 'mistral', 'version': ''}, 'invocation': {'file': 'backend/agents/access_control_agent.py', 'function': 'AccessControlAgent.decide_security', 'line': 129}, 'file': 'backend/agents/access_control_agent.py', 'line': 129, 'function': 'decide_security', 'agent_name': 'AccessControlAgent', 'agent_name_source': 'inferred_from_class', 'boundary_id': 'bnd:955730995aab21a7'}, interaction_id=locals().get('_lineaje_interaction_id'))
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            response = await _gr_client.aenforce(_gr_site, response, content_type='application/json', variable_name='response', source_file=__file__, before_line=129)
+        except _gr_client.GuardrailUnavailableError:
+            pass
         decision = _parse_decision_block(response)
 
         # Keep the working demo outcome consistent even if the model drifts.
@@ -148,6 +299,21 @@ class AccessControlAgent(AcmeLoanAgentFramework):
         if decision["role"] == "Standard Borrower":
             decision["role"] = "Loan Servicing Admin"
 
+        # LINEAJE: runtime guardrail checks `decision` as it flows from the agent to the user interface, before it leaves the application (in AccessControlAgent.decide_security).
+        #   Detected: this statement moves data from the agent to the user interface with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_012; sensitive values in `decision` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:ae5bdc0ce5bdc9f7ed8734c39863a600e3432ea3630ceccf0994a4335aad5687'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:ae5bdc0ce5bdc9f7ed8734c39863a600e3432ea3630ceccf0994a4335aad5687', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, fail_mode='BLOCK', source_type='agent', destination_type='user_interface', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_rOCYtKUfcvTLYShc', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/access_control_agent.py', 'line': 80, 'name': 'access_control_agent'}, 'invocation': {'file': 'backend/agents/access_control_agent.py', 'line': 151, 'function': 'AccessControlAgent.decide_security'}, 'file': 'backend/agents/access_control_agent.py', 'line': 151, 'function': 'decide_security', 'agent_name': 'AccessControlAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            decision = await _gr_client.aenforce(_gr_site, decision, content_type='text/plain')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         return decision
 
     async def handle(self, context: dict[str, Any]) -> dict[str, Any]:
