@@ -10,6 +10,43 @@ SECURITY NOTES (for Unifai demo):
 - Comments and descriptions could contain prompt injections
 - No malware detection
 """
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_gr_load(_f):
+    """Lineaje-added: load gr_stub_client.py beside _f or in one of its 7 parent folders. Missing or broken:
+    a pass-through client and ONE warning per process (GR_REQUIRE_CLIENT=1: ImportError instead)."""
+    import sys, os, logging, importlib.util as u, pathlib
+    n = "_lineaje_gr_stub_client"
+    if n in sys.modules: return sys.modules[n]
+    h = pathlib.Path(_f or ".").resolve().parent
+    d = [h, *h.parents][:8]
+    p = next((x / "gr_stub_client.py" for x in d if (x / "gr_stub_client.py").is_file()), None)
+    try:
+        s = u.spec_from_file_location(n, p) if p else None
+        if s is None: raise FileNotFoundError("gr_stub_client.py")
+        m = sys.modules[n] = u.module_from_spec(s); s.loader.exec_module(m); return m
+    except Exception as e:
+        sys.modules.pop(n, None)
+        w = ("gr_stub_client.py not found for %s (searched: %s)" % (_f or "<no __file__>", ", ".join(map(str, d)))
+             if p is None else "%s failed to load (%s%s)" % (p, type(e).__name__,
+                                                          " line %s" % e.lineno if isinstance(e, SyntaxError) else ""))
+        w = ("Lineaje guardrail NOT active: " + w + ". Calls pass through unchecked; set GR_REQUIRE_CLIENT=1 to fail "
+             "instead. Each deploy unit needs gr_stub_client.py beside its code and GR_SERVICE_URL plus credentials as "
+             "environment variables.")
+        if os.environ.get("GR_REQUIRE_CLIENT", "").strip() == "1": raise ImportError(w) from (None if p is None else e)
+        z = sys.__dict__.setdefault("_lineaje_gr_null", __import__('types').SimpleNamespace(STUB_API=999999, GuardrailUnavailableError=type('GuardrailUnavailableError', (PermissionError,), {}), SiteDescriptor=lambda *a, **k: None, new_interaction_id=lambda *a, **k: None, enforce=lambda _s, _p, *a, **k: _p, enforce_request=lambda _s, _p, *a, **k: _p, enforce_reply=lambda _s, _p, *a, **k: _p, _lineaje_seen=set()))
+        k = "missing" if p is None else (str(p), type(e).__name__)
+        if k not in z._lineaje_seen:
+            z._lineaje_seen.add(k); g = logging.getLogger("lineaje.guardrail"); g.log(30 if p is None else 40, w)
+            if g.hasHandlers(): sys.stderr.write(w + "\n")
+        return z
+__import__("sys").__dict__.setdefault("_lineaje_gr_load_v1", _lineaje_gr_load)
+del _lineaje_gr_load
+def _lineaje_load_gr_client():
+    """Lineaje-added: this file's gr_stub_client.py (the loader _lineaje_gr_load registered)."""
+    return __import__("sys").__dict__["_lineaje_gr_load_v1"](globals().get("__file__"))
+if __import__("os").environ.get("GR_REQUIRE_CLIENT", "").strip() == "1": __import__("sys").__dict__["_lineaje_gr_load_v1"](globals().get("__file__"))
+
 
 import base64
 import io
@@ -72,8 +109,24 @@ class ImageParser:
                     metadata[tag] = value
 
             # VULNERABILITY: Log metadata without scanning
+            _lineaje_payload = "Image metadata extracted"
+            # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in ImageParser.extract_metadata).
+            #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+            #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:51488602996e6b7101fac4a750bdbf7de3ffffcda0c432b73181e3de5bc3e364'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:51488602996e6b7101fac4a750bdbf7de3ffffcda0c432b73181e3de5bc3e364', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'invocation': {'file': 'backend/file_parsers/image_parser.py', 'line': 75, 'function': 'ImageParser.extract_metadata'}, 'file': 'backend/file_parsers/image_parser.py', 'line': 75, 'function': 'extract_metadata', 'agent_name': 'ImageParser', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                    __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                    raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+                _lineaje_payload = await _gr_client.aenforce(_gr_site, _lineaje_payload, content_type='application/json')
+            except _gr_client.GuardrailUnavailableError:
+                pass
+            except PermissionError:
+                pass
             logger.info(
-                "Image metadata extracted",
+                _lineaje_payload,
                 extra={
                     "format": image.format,
                     "size": image.size,
@@ -83,10 +136,41 @@ class ImageParser:
                 }
             )
 
+            # LINEAJE: runtime guardrail checks `metadata` as it flows from the agent to the user interface, before it leaves the application (in ImageParser.extract_metadata).
+            #   Detected: this statement moves data from the agent to the user interface with no runtime policy check (detection confidence: high).
+            #   Decision: the Guardrail evaluates AI_DAT_SEC_012; sensitive values in `metadata` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:ec3d8e722d0075200cb4fa022ebca1a2024d83ad856e0637fd7679fe542fb72c'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:ec3d8e722d0075200cb4fa022ebca1a2024d83ad856e0637fd7679fe542fb72c', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, fail_mode='BLOCK', source_type='agent', destination_type='user_interface', components={'invocation': {'file': 'backend/file_parsers/image_parser.py', 'line': 86, 'function': 'ImageParser.extract_metadata'}, 'file': 'backend/file_parsers/image_parser.py', 'line': 86, 'function': 'extract_metadata', 'agent_name': 'ImageParser', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                    __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                    raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+                metadata = await _gr_client.aenforce(_gr_site, metadata, content_type='text/plain')
+            except _gr_client.GuardrailUnavailableError:
+                pass
+            except PermissionError:
+                pass
             return metadata
 
         except Exception as e:
-            logger.error(f"Image metadata extraction error: {e}")
+            _lineaje_payload = f"Image metadata extraction error: {e}"
+            # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in ImageParser.extract_metadata).
+            #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+            #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:8bc045cf31083a6b4ecad324a61aa7de53e29d5bf86f9e2c7149a493f9f916bd'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:8bc045cf31083a6b4ecad324a61aa7de53e29d5bf86f9e2c7149a493f9f916bd', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'invocation': {'file': 'backend/file_parsers/image_parser.py', 'line': 89, 'function': 'ImageParser.extract_metadata'}, 'file': 'backend/file_parsers/image_parser.py', 'line': 89, 'function': 'extract_metadata', 'agent_name': 'ImageParser', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                    __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                    raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+                _lineaje_payload = await _gr_client.aenforce(_gr_site, _lineaje_payload, content_type='application/json')
+            except _gr_client.GuardrailUnavailableError:
+                pass
+            except PermissionError:
+                pass
+            logger.error(_lineaje_payload)
             return {"error": str(e)}
 
     async def extract_text_fields(self, metadata: dict) -> str:
@@ -118,8 +202,24 @@ class ImageParser:
                 value = metadata[field]
                 if value and isinstance(value, str):
                     text_fields.append(f"{field}: {value}")
+                    _lineaje_payload = f"Found text in {field}"
+                    # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in ImageParser.extract_text_fields).
+                    #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+                    #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+                    #   Do not remove without review. site_id='site:sha256:48eecbd2f1f9f943e642bd49b7f0a7e4be94c34db6e5975ee419f05dbb8cd715'
+                    _gr_client = _lineaje_load_gr_client()
+                    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:48eecbd2f1f9f943e642bd49b7f0a7e4be94c34db6e5975ee419f05dbb8cd715', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'invocation': {'file': 'backend/file_parsers/image_parser.py', 'line': 121, 'function': 'ImageParser.extract_text_fields'}, 'file': 'backend/file_parsers/image_parser.py', 'line': 121, 'function': 'extract_text_fields', 'agent_name': 'ImageParser', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+                    try:
+                        if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                            __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                            raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+                        _lineaje_payload = await _gr_client.aenforce(_gr_site, _lineaje_payload, content_type='application/json')
+                    except _gr_client.GuardrailUnavailableError:
+                        pass
+                    except PermissionError:
+                        pass
                     logger.debug(
-                        f"Found text in {field}",
+                        _lineaje_payload,
                         extra={
                             "field": field,
                             # VULNERABILITY: Field content logged
@@ -154,13 +254,60 @@ class ImageParser:
                     "the transcribed text, no commentary."
                 ),
             )
+            _lineaje_payload = "Image visible-text transcription complete"
+            # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in ImageParser.extract_visible_text).
+            #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+            #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:01de8d35067d0d2c94bcfa9ba328b7a936048d911f8d2b00bd73ea1edeed2711'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:01de8d35067d0d2c94bcfa9ba328b7a936048d911f8d2b00bd73ea1edeed2711', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'invocation': {'file': 'backend/file_parsers/image_parser.py', 'line': 157, 'function': 'ImageParser.extract_visible_text'}, 'file': 'backend/file_parsers/image_parser.py', 'line': 157, 'function': 'extract_visible_text', 'agent_name': 'ImageParser', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                    __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                    raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+                _lineaje_payload = await _gr_client.aenforce(_gr_site, _lineaje_payload, content_type='application/json')
+            except _gr_client.GuardrailUnavailableError:
+                pass
+            except PermissionError:
+                pass
             logger.info(
-                "Image visible-text transcription complete",
+                _lineaje_payload,
                 extra={"model": model, "text_preview": transcription[:200]},
             )
+            # LINEAJE: runtime guardrail checks `transcription` as it flows from the agent to the user interface, before it leaves the application (in ImageParser.extract_visible_text).
+            #   Detected: this statement moves data from the agent to the user interface with no runtime policy check (detection confidence: high).
+            #   Decision: the Guardrail evaluates AI_DAT_SEC_012; sensitive values in `transcription` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:a8658ad6dbc910ee0e7a954b6a734761c16b4b37b0ecbd4d52271468282490cb'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:a8658ad6dbc910ee0e7a954b6a734761c16b4b37b0ecbd4d52271468282490cb', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, fail_mode='BLOCK', source_type='agent', destination_type='user_interface', components={'invocation': {'file': 'backend/file_parsers/image_parser.py', 'line': 161, 'function': 'ImageParser.extract_visible_text'}, 'file': 'backend/file_parsers/image_parser.py', 'line': 161, 'function': 'extract_visible_text', 'agent_name': 'ImageParser', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                    __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                    raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+                transcription = await _gr_client.aenforce(_gr_site, transcription, content_type='text/plain')
+            except _gr_client.GuardrailUnavailableError:
+                pass
+            except PermissionError:
+                pass
             return transcription
         except Exception as exc:
-            logger.error(f"Image vision transcription error: {exc}")
+            _lineaje_payload = f"Image vision transcription error: {exc}"
+            # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in ImageParser.extract_visible_text).
+            #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+            #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:f0ac34bac31196685f08ed64f5f0548140bde0e24ef4964599a2e56f1ee4904f'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:f0ac34bac31196685f08ed64f5f0548140bde0e24ef4964599a2e56f1ee4904f', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'invocation': {'file': 'backend/file_parsers/image_parser.py', 'line': 163, 'function': 'ImageParser.extract_visible_text'}, 'file': 'backend/file_parsers/image_parser.py', 'line': 163, 'function': 'extract_visible_text', 'agent_name': 'ImageParser', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                    __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                    raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+                _lineaje_payload = await _gr_client.aenforce(_gr_site, _lineaje_payload, content_type='application/json')
+            except _gr_client.GuardrailUnavailableError:
+                pass
+            except PermissionError:
+                pass
+            logger.error(_lineaje_payload)
             return ""
 
     async def extract_all(self, image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
