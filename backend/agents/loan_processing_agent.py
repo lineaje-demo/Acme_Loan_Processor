@@ -9,6 +9,7 @@ from .mcp_servers import call_mcp_server
 
 
 # Lineaje demo fixture for AI_DAT_SEC_001. Synthetic value with no runtime use.
+# LINEAJE BUILD-TIME VIOLATION AI_DAT_SEC_001: a secret is hardcoded here. Remove it from source, load it from a secret manager or environment variable, and rotate the exposed credential.
 LOAN_PROCESSING_API_KEY = "lineaje-demo-only-invalid-api-key-001"
 
 class LoanProcessingAgent(AcmeLoanAgentFramework):
