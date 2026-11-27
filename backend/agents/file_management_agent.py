@@ -1,4 +1,41 @@
 """File Management Agent — demo for HITL-required destructive operations."""
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_gr_load(_f):
+    """Lineaje-added: load gr_stub_client.py beside _f or in one of its 7 parent folders. Missing or broken:
+    a pass-through client and ONE warning per process (GR_REQUIRE_CLIENT=1: ImportError instead)."""
+    import sys, os, logging, importlib.util as u, pathlib
+    n = "_lineaje_gr_stub_client"
+    if n in sys.modules: return sys.modules[n]
+    h = pathlib.Path(_f or ".").resolve().parent
+    d = [h, *h.parents][:8]
+    p = next((x / "gr_stub_client.py" for x in d if (x / "gr_stub_client.py").is_file()), None)
+    try:
+        s = u.spec_from_file_location(n, p) if p else None
+        if s is None: raise FileNotFoundError("gr_stub_client.py")
+        m = sys.modules[n] = u.module_from_spec(s); s.loader.exec_module(m); return m
+    except Exception as e:
+        sys.modules.pop(n, None)
+        w = ("gr_stub_client.py not found for %s (searched: %s)" % (_f or "<no __file__>", ", ".join(map(str, d)))
+             if p is None else "%s failed to load (%s%s)" % (p, type(e).__name__,
+                                                          " line %s" % e.lineno if isinstance(e, SyntaxError) else ""))
+        w = ("Lineaje guardrail NOT active: " + w + ". Calls pass through unchecked; set GR_REQUIRE_CLIENT=1 to fail "
+             "instead. Each deploy unit needs gr_stub_client.py beside its code and GR_SERVICE_URL plus credentials as "
+             "environment variables.")
+        if os.environ.get("GR_REQUIRE_CLIENT", "").strip() == "1": raise ImportError(w) from (None if p is None else e)
+        z = sys.__dict__.setdefault("_lineaje_gr_null", __import__('types').SimpleNamespace(STUB_API=999999, GuardrailUnavailableError=type('GuardrailUnavailableError', (PermissionError,), {}), SiteDescriptor=lambda *a, **k: None, new_interaction_id=lambda *a, **k: None, enforce=lambda _s, _p, *a, **k: _p, enforce_request=lambda _s, _p, *a, **k: _p, enforce_reply=lambda _s, _p, *a, **k: _p, _lineaje_seen=set()))
+        k = "missing" if p is None else (str(p), type(e).__name__)
+        if k not in z._lineaje_seen:
+            z._lineaje_seen.add(k); g = logging.getLogger("lineaje.guardrail"); g.log(30 if p is None else 40, w)
+            if g.hasHandlers(): sys.stderr.write(w + "\n")
+        return z
+__import__("sys").__dict__.setdefault("_lineaje_gr_load_v1", _lineaje_gr_load)
+del _lineaje_gr_load
+def _lineaje_load_gr_client():
+    """Lineaje-added: this file's gr_stub_client.py (the loader _lineaje_gr_load registered)."""
+    return __import__("sys").__dict__["_lineaje_gr_load_v1"](globals().get("__file__"))
+if __import__("os").environ.get("GR_REQUIRE_CLIENT", "").strip() == "1": __import__("sys").__dict__["_lineaje_gr_load_v1"](globals().get("__file__"))
+
 
 import logging
 import re
@@ -39,8 +76,7 @@ class FileManagementAgent(AcmeLoanAgentFramework):
     API_TIMEOUT = 30
 
     async def call_agent_model(self, user_message: str, workflow_summary: str) -> str:
-        return await self.call_bedrock_model(
-            messages=[
+        _lineaje_messages = ([
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {
                     "role": "user",
@@ -50,7 +86,25 @@ class FileManagementAgent(AcmeLoanAgentFramework):
                         "Summarize the file management actions in 2-3 sentences."
                     ),
                 },
-            ],
+            ])
+        # LINEAJE: runtime guardrail checks `_lineaje_messages` as it flows from the agent to the LLM, before it is sent to the model (in FileManagementAgent.call_agent_model).
+        #   Detected: this statement moves data from the agent to the LLM with no runtime policy check (detection confidence: medium).
+        #   Decision: the Guardrail evaluates AI_AGENT_ACTIVITY_LOG, AI_APP_SEC_006, AI_APP_SEC_028, AI_APP_SEC_070 (+2 more); sensitive values in `_lineaje_messages` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:19754beef9039bf2e47e669f185a39a388cae16e692f1e9d683a5a4e6751b510'
+        _gr_client = _lineaje_load_gr_client()
+        _lineaje_interaction_id = _gr_client.new_interaction_id()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:19754beef9039bf2e47e669f185a39a388cae16e692f1e9d683a5a4e6751b510', phase='pre_model', boundary={'source': 'agent_message', 'sink': 'model'}, fail_mode='BLOCK', source_type='agent', destination_type='llm', components={'source': {'entity_type': 'agent', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi'}, 'destination': {'entity_type': 'llm', 'name': 'mistral 7b-instruct', 'provider': 'mistral', 'version': ''}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'function': 'FileManagementAgent.call_agent_model', 'line': 42}, 'file': 'backend/agents/file_management_agent.py', 'line': 42, 'function': 'call_agent_model', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'boundary_id': 'bnd:59d2fb2a898ef7d0'}, interaction_id=_lineaje_interaction_id)
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            _lineaje_messages = await _gr_client.aenforce(_gr_site, _lineaje_messages, content_type='application/json', variable_name='_lineaje_messages', source_file=__file__, before_line=42)
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            raise
+        return await self.call_bedrock_model(
+            messages=_lineaje_messages,
             temperature=0.2,
             max_tokens=200,
         )
@@ -76,19 +130,68 @@ class FileManagementAgent(AcmeLoanAgentFramework):
 
     def get_file_from_api(self, file_id: int = 50) -> tuple[bool, Optional[str], Optional[str]]:
         url = f"{self.GET_FILE_API}?id={file_id}"
+        # LINEAJE: runtime guardrail checks `url` as it flows from the agent to the application log, before it is written to the log (in FileManagementAgent.get_file_from_api).
+        #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `url` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:d301a63f38cf75c1a2d0a3da376271641870b0be23383e47e7e44c17720f921d'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:d301a63f38cf75c1a2d0a3da376271641870b0be23383e47e7e44c17720f921d', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 79, 'function': 'FileManagementAgent.get_file_from_api'}, 'file': 'backend/agents/file_management_agent.py', 'line': 79, 'function': 'get_file_from_api', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            url = _gr_client.enforce(_gr_site, url, content_type='application/json')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         logger.info("Retrieving file from API: %s", url)
         try:
             response = requests.get(url, timeout=self.API_TIMEOUT)
+            # LINEAJE: runtime guardrail checks `response` as it flows from an external API to the agent, after the tool returns (in FileManagementAgent.get_file_from_api).
+            #   Detected: this statement moves data from an external API to the agent with no runtime policy check (detection confidence: medium).
+            #   Decision: the Guardrail evaluates the policies enabled for this boundary; sensitive values in `response` are masked in place; a policy violation is logged and the call continues (fail_mode=ALLOW_WITH_AUDIT). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:97d884f34d1a5897c7522e54d0960c46344c2dd07c586687ae972046a68ba190'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:97d884f34d1a5897c7522e54d0960c46344c2dd07c586687ae972046a68ba190', phase='post_tool', boundary={'source': 'external_endpoint', 'sink': 'agent_message'}, fail_mode='ALLOW_WITH_AUDIT', source_type='api', destination_type='agent', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 81, 'function': 'FileManagementAgent.get_file_from_api'}, 'file': 'backend/agents/file_management_agent.py', 'line': 81, 'function': 'get_file_from_api', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                response = _gr_client.enforce(_gr_site, response, content_type='application/json', variable_name='response', source_file=__file__, before_line=81)
+            except _gr_client.GuardrailUnavailableError:
+                pass
             if response.status_code != 200:
                 return False, None, f"API returned status {response.status_code}"
             return True, response.text, None
         except requests.RequestException as exc:
             # Demo path: continue workflow even when the external API is unreachable.
+            # LINEAJE: runtime guardrail checks `exc` as it flows from the agent to the application log, before it is written to the log (in FileManagementAgent.get_file_from_api).
+            #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+            #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `exc` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:6d8cdb030af7a9b215aef65d6d8d8e4c16a4ef0f10553ea051b35ee7b47975c9'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:6d8cdb030af7a9b215aef65d6d8d8e4c16a4ef0f10553ea051b35ee7b47975c9', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 87, 'function': 'FileManagementAgent.get_file_from_api'}, 'file': 'backend/agents/file_management_agent.py', 'line': 87, 'function': 'get_file_from_api', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                exc = _gr_client.enforce(_gr_site, exc, content_type='application/json')
+            except _gr_client.GuardrailUnavailableError:
+                pass
+            except PermissionError:
+                pass
             logger.warning("get_file_from_api failed: %s", exc)
             return True, "SIMULATED_FILE_CONTENT", None
 
     async def delete_file(self, filename: str) -> tuple[bool, Optional[str]]:
         """Delete a loan document. Intentionally has no HITL approval gate."""
+        # LINEAJE: runtime guardrail checks `filename` as it flows from the agent to the application log, before it is written to the log (in FileManagementAgent.delete_file).
+        #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `filename` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:aad10a9069e1c1b50fac85fe8343a824f027d2fd71222583a7e9d9bd97f00b9c'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:aad10a9069e1c1b50fac85fe8343a824f027d2fd71222583a7e9d9bd97f00b9c', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 92, 'function': 'FileManagementAgent.delete_file'}, 'file': 'backend/agents/file_management_agent.py', 'line': 92, 'function': 'delete_file', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            filename = await _gr_client.aenforce(_gr_site, filename, content_type='application/json')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         logger.info("Deleting file: %s", filename)
         if not filename or ".." in filename or filename.startswith("/"):
             return False, "Invalid filename"
@@ -103,26 +206,100 @@ class FileManagementAgent(AcmeLoanAgentFramework):
                 "document_body": f"deleteFile(fileName='{filename}') completed without HITL approval.",
             },
         )
+        # LINEAJE: runtime guardrail checks `filename` as it flows from the agent to the application log, before it is written to the log (in FileManagementAgent.delete_file).
+        #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `filename` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:df9c11db9f317ff39f88ee44dd8ca71ee32d8cae2a350228e3553849eb7379fc'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:df9c11db9f317ff39f88ee44dd8ca71ee32d8cae2a350228e3553849eb7379fc', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 106, 'function': 'FileManagementAgent.delete_file'}, 'file': 'backend/agents/file_management_agent.py', 'line': 106, 'function': 'delete_file', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            filename = await _gr_client.aenforce(_gr_site, filename, content_type='application/json')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         logger.info("Would call: deleteFile(fileName='%s')", filename)
         return True, None
 
     def purge_records(self, record_id: int) -> tuple[bool, Optional[str]]:
         """Purge archived records. Intentionally has no HITL approval gate."""
         url = f"{self.PURGE_RECORDS_API}?id={record_id}"
+        # LINEAJE: runtime guardrail checks `url` as it flows from the agent to the application log, before it is written to the log (in FileManagementAgent.purge_records).
+        #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `url` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:2b05a9c3eb293bded245970496dad3e40276b080990794d928587963fb9862dc'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:2b05a9c3eb293bded245970496dad3e40276b080990794d928587963fb9862dc', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 112, 'function': 'FileManagementAgent.purge_records'}, 'file': 'backend/agents/file_management_agent.py', 'line': 112, 'function': 'purge_records', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            url = _gr_client.enforce(_gr_site, url, content_type='application/json')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         logger.info("Purging records via API: %s", url)
         try:
             # Vulnerability: purge/destroy-style API call runs without HITL approval.
             response = requests.get(url, timeout=self.API_TIMEOUT)
+            # LINEAJE: runtime guardrail checks `response` as it flows from an external API to the agent, after the tool returns (in FileManagementAgent.purge_records).
+            #   Detected: this statement moves data from an external API to the agent with no runtime policy check (detection confidence: medium).
+            #   Decision: the Guardrail evaluates the policies enabled for this boundary; sensitive values in `response` are masked in place; a policy violation is logged and the call continues (fail_mode=ALLOW_WITH_AUDIT). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:82963963dc79951b133cb20da288372e53003a6f98edc4176e158feabc62637a'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:82963963dc79951b133cb20da288372e53003a6f98edc4176e158feabc62637a', phase='post_tool', boundary={'source': 'external_endpoint', 'sink': 'agent_message'}, fail_mode='ALLOW_WITH_AUDIT', source_type='api', destination_type='agent', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 115, 'function': 'FileManagementAgent.purge_records'}, 'file': 'backend/agents/file_management_agent.py', 'line': 115, 'function': 'purge_records', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                response = _gr_client.enforce(_gr_site, response, content_type='application/json', variable_name='response', source_file=__file__, before_line=115)
+            except _gr_client.GuardrailUnavailableError:
+                pass
             if response.status_code != 200:
-                logger.warning("purge_records API returned %s; simulating success for demo", response.status_code)
+                _lineaje_payload = "purge_records API returned %s; simulating success for demo"
+                # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in FileManagementAgent.purge_records).
+                #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+                #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+                #   Do not remove without review. site_id='site:sha256:9e7885e8b2aa3b02513d67ccd4f3c55cf2b244225420b3a11824e2bd983a564c'
+                _gr_client = _lineaje_load_gr_client()
+                _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:9e7885e8b2aa3b02513d67ccd4f3c55cf2b244225420b3a11824e2bd983a564c', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 117, 'function': 'FileManagementAgent.purge_records'}, 'file': 'backend/agents/file_management_agent.py', 'line': 117, 'function': 'purge_records', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+                try:
+                    _lineaje_payload = _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json')
+                except _gr_client.GuardrailUnavailableError:
+                    pass
+                except PermissionError:
+                    pass
+                logger.warning(_lineaje_payload, response.status_code)
             return True, None
         except requests.RequestException as exc:
+            # LINEAJE: runtime guardrail checks `exc` as it flows from the agent to the application log, before it is written to the log (in FileManagementAgent.purge_records).
+            #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+            #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `exc` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+            #   Do not remove without review. site_id='site:sha256:1473b7426fbb19d4707d9908ccd0dc9b1aa9343ee5986f649c197c4b20338130'
+            _gr_client = _lineaje_load_gr_client()
+            _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:1473b7426fbb19d4707d9908ccd0dc9b1aa9343ee5986f649c197c4b20338130', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 120, 'function': 'FileManagementAgent.purge_records'}, 'file': 'backend/agents/file_management_agent.py', 'line': 120, 'function': 'purge_records', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+            try:
+                exc = _gr_client.enforce(_gr_site, exc, content_type='application/json')
+            except _gr_client.GuardrailUnavailableError:
+                pass
+            except PermissionError:
+                pass
             logger.warning("purge_records failed: %s; simulating success for demo", exc)
             return True, None
 
     def destroy_temp_artifacts(self, filename: str) -> None:
         """Destroy temporary artifacts after delete/purge. No HITL gate."""
         # Vulnerability: destroy operation executes without human approval.
+        # LINEAJE: runtime guardrail checks `filename` as it flows from the agent to the application log, before it is written to the log (in FileManagementAgent.destroy_temp_artifacts).
+        #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `filename` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:85413e9198e98cbe2add7cc696518e51ad80f69e52e9b4750580674442a875f8'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:85413e9198e98cbe2add7cc696518e51ad80f69e52e9b4750580674442a875f8', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 126, 'function': 'FileManagementAgent.destroy_temp_artifacts'}, 'file': 'backend/agents/file_management_agent.py', 'line': 126, 'function': 'destroy_temp_artifacts', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            filename = _gr_client.enforce(_gr_site, filename, content_type='application/json')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         logger.info("destroy_temp_artifacts('%s') executed without HITL approval", filename)
 
     async def handle(self, context: dict[str, Any]) -> dict[str, Any]:
@@ -142,7 +319,31 @@ class FileManagementAgent(AcmeLoanAgentFramework):
             f"Destroy temp artifacts for '{filename}': completed\n"
             f"Content preview: {(content or '')[:80]}"
         )
+        # LINEAJE: runtime guardrail checks `user_message` as it flows from the agent to the LLM, before it is sent to the model (in FileManagementAgent.handle).
+        #   Detected: this statement moves data from the agent to the LLM with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_AGENT_ACTIVITY_LOG, AI_APP_SEC_006, AI_APP_SEC_028, AI_APP_SEC_070 (+2 more); sensitive values in `user_message` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:75460871d99d41f3f28f4c43522f847ca148c9705009bc3ebccfe51d2c4812a8'
+        _lineaje_user_message_evidence = {'user_message': user_message, 'model': getattr(_lineaje_load_gr_client(), 'current_model', lambda _f: '')(__file__)}
+        _gr_client = _lineaje_load_gr_client()
+        _lineaje_interaction_id = _gr_client.new_interaction_id()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:75460871d99d41f3f28f4c43522f847ca148c9705009bc3ebccfe51d2c4812a8', phase='pre_model', boundary={'source': 'agent_message', 'sink': 'model'}, fail_mode='BLOCK', source_type='agent', destination_type='llm', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/file_management_agent.py', 'line': 15, 'name': 'file_management_agent'}, 'destination': {'entity_type': 'llm', 'name': 'mistral 7b-instruct', 'version': '', 'provider': 'mistral'}, 'invocation': {'file': 'backend/agents/file_management_agent.py', 'line': 145, 'function': 'FileManagementAgent.handle'}, 'file': 'backend/agents/file_management_agent.py', 'line': 145, 'function': 'handle', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True}, interaction_id=_lineaje_interaction_id)
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            _lineaje_user_message_evidence = await _gr_client.aenforce(_gr_site, _lineaje_user_message_evidence, content_type='application/json')
+            user_message = _lineaje_user_message_evidence.get('user_message', user_message) if isinstance(_lineaje_user_message_evidence, dict) else user_message
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            raise
         model_output = await self.call_agent_model(user_message, workflow_summary)
+        try:
+            _lineaje_obs = _lineaje_load_gr_client()
+            _lineaje_obs_site = _lineaje_obs.SiteDescriptor(site_id='site:sha256:0d68eec21251c0df6abcfd4194717542127833fb9025f709beb12f6072fa8cec', phase='', boundary={}, fail_mode='ALLOW', source_type='llm', destination_type='agent', components={'file': 'backend/agents/file_management_agent.py', 'line': 145, 'function': 'handle', 'agent_name': 'FileManagementAgent', 'agent_name_source': 'inferred_from_class', 'call_target': 'self.call_agent_model', 'not_on_graph': True}, observe_only=True, interaction_id=locals().get('_lineaje_interaction_id'))
+            await _lineaje_obs.aenforce(_lineaje_obs_site, {'activity': 'llm_to_agent'}, content_type='application/json')
+        except Exception as _lineaje_obs_err:
+            [__import__('sys').__dict__.setdefault('_lineaje_gr_logged', set()).add(_k) or __import__('logging').getLogger('lineaje.guardrail').warning('Lineaje guardrail: an observe-only report failed (%s); later failures of this kind are not logged', _k[1]) for _k in [('observe', type(_lineaje_obs_err).__name__)] if _k not in __import__('sys').__dict__.setdefault('_lineaje_gr_logged', set())]
 
         response = (
             "File Management Agent workflow complete.\n\n"

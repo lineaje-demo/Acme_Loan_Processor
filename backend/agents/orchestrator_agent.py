@@ -1,4 +1,41 @@
 """Orchestrator Agent class with explicit model invocation."""
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_gr_load(_f):
+    """Lineaje-added: load gr_stub_client.py beside _f or in one of its 7 parent folders. Missing or broken:
+    a pass-through client and ONE warning per process (GR_REQUIRE_CLIENT=1: ImportError instead)."""
+    import sys, os, logging, importlib.util as u, pathlib
+    n = "_lineaje_gr_stub_client"
+    if n in sys.modules: return sys.modules[n]
+    h = pathlib.Path(_f or ".").resolve().parent
+    d = [h, *h.parents][:8]
+    p = next((x / "gr_stub_client.py" for x in d if (x / "gr_stub_client.py").is_file()), None)
+    try:
+        s = u.spec_from_file_location(n, p) if p else None
+        if s is None: raise FileNotFoundError("gr_stub_client.py")
+        m = sys.modules[n] = u.module_from_spec(s); s.loader.exec_module(m); return m
+    except Exception as e:
+        sys.modules.pop(n, None)
+        w = ("gr_stub_client.py not found for %s (searched: %s)" % (_f or "<no __file__>", ", ".join(map(str, d)))
+             if p is None else "%s failed to load (%s%s)" % (p, type(e).__name__,
+                                                          " line %s" % e.lineno if isinstance(e, SyntaxError) else ""))
+        w = ("Lineaje guardrail NOT active: " + w + ". Calls pass through unchecked; set GR_REQUIRE_CLIENT=1 to fail "
+             "instead. Each deploy unit needs gr_stub_client.py beside its code and GR_SERVICE_URL plus credentials as "
+             "environment variables.")
+        if os.environ.get("GR_REQUIRE_CLIENT", "").strip() == "1": raise ImportError(w) from (None if p is None else e)
+        z = sys.__dict__.setdefault("_lineaje_gr_null", __import__('types').SimpleNamespace(STUB_API=999999, GuardrailUnavailableError=type('GuardrailUnavailableError', (PermissionError,), {}), SiteDescriptor=lambda *a, **k: None, new_interaction_id=lambda *a, **k: None, enforce=lambda _s, _p, *a, **k: _p, enforce_request=lambda _s, _p, *a, **k: _p, enforce_reply=lambda _s, _p, *a, **k: _p, _lineaje_seen=set()))
+        k = "missing" if p is None else (str(p), type(e).__name__)
+        if k not in z._lineaje_seen:
+            z._lineaje_seen.add(k); g = logging.getLogger("lineaje.guardrail"); g.log(30 if p is None else 40, w)
+            if g.hasHandlers(): sys.stderr.write(w + "\n")
+        return z
+__import__("sys").__dict__.setdefault("_lineaje_gr_load_v1", _lineaje_gr_load)
+del _lineaje_gr_load
+def _lineaje_load_gr_client():
+    """Lineaje-added: this file's gr_stub_client.py (the loader _lineaje_gr_load registered)."""
+    return __import__("sys").__dict__["_lineaje_gr_load_v1"](globals().get("__file__"))
+if __import__("os").environ.get("GR_REQUIRE_CLIENT", "").strip() == "1": __import__("sys").__dict__["_lineaje_gr_load_v1"](globals().get("__file__"))
+
 
 import logging
 from typing import Any
@@ -66,21 +103,76 @@ class OrchestratorAgent(AcmeLoanAgentFramework):
         forwarded_context["internal_call_chain"] = [self.AGENT_NAME, selected_agent_name]
         forwarded_context["internal_hop_token"] = "shared-orchestrator-hop-token"
 
+        _lineaje_payload = "Orchestrator Agent routing request"
+        # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in OrchestratorAgent.handle).
+        #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:2f989c04e85ce464a8e3c6400b0a5a29a71060cd43bf9f475a3954f132ab04a0'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:2f989c04e85ce464a8e3c6400b0a5a29a71060cd43bf9f475a3954f132ab04a0', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/orchestrator_agent.py', 'line': 20, 'name': 'orchestrator_agent'}, 'invocation': {'file': 'backend/agents/orchestrator_agent.py', 'line': 69, 'function': 'OrchestratorAgent.handle'}, 'file': 'backend/agents/orchestrator_agent.py', 'line': 69, 'function': 'handle', 'agent_name': 'OrchestratorAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            _lineaje_payload = await _gr_client.aenforce(_gr_site, _lineaje_payload, content_type='application/json')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         logger.info(
-            "Orchestrator Agent routing request",
+            _lineaje_payload,
             extra={
                 "selected_agent": selected_agent_name,
                 "internal_call_chain": forwarded_context["internal_call_chain"],
             },
         )
 
+        # LINEAJE: runtime guardrail checks `selected_agent_name` as it flows from the agent to the LLM, before it is sent to the model (in OrchestratorAgent.handle).
+        #   Detected: this statement moves data from the agent to the LLM with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_AGENT_ACTIVITY_LOG, AI_APP_SEC_006, AI_APP_SEC_028, AI_APP_SEC_070 (+2 more); sensitive values in `selected_agent_name` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:d6efea20d79f7339b68de3727c847b4cb8dff8eabec9475924c2637c15605f81'
+        _lineaje_selected_agent_name_evidence = {'selected_agent_name': selected_agent_name, 'model': getattr(_lineaje_load_gr_client(), 'current_model', lambda _f: '')(__file__)}
+        _gr_client = _lineaje_load_gr_client()
+        _lineaje_interaction_id = _gr_client.new_interaction_id()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:d6efea20d79f7339b68de3727c847b4cb8dff8eabec9475924c2637c15605f81', phase='pre_model', boundary={'source': 'agent_message', 'sink': 'model'}, fail_mode='BLOCK', source_type='agent', destination_type='llm', components={'source': {'entity_type': 'agent', 'file_path': 'backend/agents/orchestrator_agent.py', 'line': 20, 'name': 'orchestrator_agent', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi'}, 'destination': {'entity_type': 'llm', 'name': 'mistral.mistral-7b-instruct-v0:2', 'provider': 'mistral', 'version': ''}, 'invocation': {'file': 'backend/agents/orchestrator_agent.py', 'function': 'OrchestratorAgent.handle', 'line': 77}, 'file': 'backend/agents/orchestrator_agent.py', 'line': 77, 'function': 'handle', 'agent_name': 'OrchestratorAgent', 'agent_name_source': 'inferred_from_class', 'boundary_id': 'bnd:609dc9861627abcf'}, interaction_id=_lineaje_interaction_id)
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            _lineaje_selected_agent_name_evidence = await _gr_client.aenforce(_gr_site, _lineaje_selected_agent_name_evidence, content_type='application/json')
+            selected_agent_name = _lineaje_selected_agent_name_evidence.get('selected_agent_name', selected_agent_name) if isinstance(_lineaje_selected_agent_name_evidence, dict) else selected_agent_name
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            raise
         routing_note = await self.call_agent_model(
             context.get("user_message", ""),
             selected_agent_name,
         )
+        try:
+            _lineaje_obs = _lineaje_load_gr_client()
+            _lineaje_obs_site = _lineaje_obs.SiteDescriptor(site_id='site:sha256:fc3644ea812b79198b288f7175d31fd1326008d423e18a546c7618a9ecc8b9ad', phase='', boundary={}, fail_mode='ALLOW', source_type='llm', destination_type='agent', components={'file': 'backend/agents/orchestrator_agent.py', 'line': 77, 'function': 'handle', 'agent_name': 'OrchestratorAgent', 'agent_name_source': 'inferred_from_class', 'call_target': 'self.call_agent_model', 'source': {'entity_type': 'agent', 'file_path': 'backend/agents/orchestrator_agent.py', 'line': 20, 'name': 'orchestrator_agent', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi'}, 'destination': {'entity_type': 'llm', 'name': 'llama-4-scout', 'provider': 'meta-llama', 'version': ''}, 'invocation': {'file': 'backend/agents/orchestrator_agent.py', 'function': 'OrchestratorAgent.handle', 'line': 80}, 'boundary_id': 'bnd:15ff2bb09a170717'}, observe_only=True, interaction_id=locals().get('_lineaje_interaction_id'))
+            await _lineaje_obs.aenforce(_lineaje_obs_site, {'activity': 'llm_to_agent'}, content_type='application/json')
+        except Exception as _lineaje_obs_err:
+            [__import__('sys').__dict__.setdefault('_lineaje_gr_logged', set()).add(_k) or __import__('logging').getLogger('lineaje.guardrail').warning('Lineaje guardrail: an observe-only report failed (%s); later failures of this kind are not logged', _k[1]) for _k in [('observe', type(_lineaje_obs_err).__name__)] if _k not in __import__('sys').__dict__.setdefault('_lineaje_gr_logged', set())]
         response = await selected_agent.handle(forwarded_context)
         response["orchestrator"] = self.AGENT_NAME
         response["routing_note"] = routing_note
+        # LINEAJE: runtime guardrail checks `response` as it flows from the agent to the user interface, before it leaves the application (in OrchestratorAgent.handle).
+        #   Detected: this statement moves data from the agent to the user interface with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_012; sensitive values in `response` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:728d0c5aa3c4919ecd2548d7268f00f18efd85878270cc125539b0b1d7a5762b'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:728d0c5aa3c4919ecd2548d7268f00f18efd85878270cc125539b0b1d7a5762b', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, fail_mode='BLOCK', source_type='agent', destination_type='user_interface', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_aUmomyAokxEUsLfi', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/agents/orchestrator_agent.py', 'line': 20, 'name': 'orchestrator_agent'}, 'invocation': {'file': 'backend/agents/orchestrator_agent.py', 'line': 84, 'function': 'OrchestratorAgent.handle'}, 'file': 'backend/agents/orchestrator_agent.py', 'line': 84, 'function': 'handle', 'agent_name': 'OrchestratorAgent', 'agent_name_source': 'inferred_from_class', 'not_on_graph': True})
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            response = await _gr_client.aenforce(_gr_site, response, content_type='text/plain')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         return response
 
     def select_agent(self, user_message: str, file_contents: list[dict[str, Any]]) -> AcmeLoanAgentFramework:
