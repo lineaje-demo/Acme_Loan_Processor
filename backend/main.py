@@ -5,6 +5,43 @@ This entry point exposes the vulnerable multi-agent loan workflow used by the
 demo UI. The backend now routes through a central agent catalog so the agent
 names, model names, and MCP server names are easy to inspect in source.
 """
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+def _lineaje_gr_load(_f):
+    """Lineaje-added: load gr_stub_client.py beside _f or in one of its 7 parent folders. Missing or broken:
+    a pass-through client and ONE warning per process (GR_REQUIRE_CLIENT=1: ImportError instead)."""
+    import sys, os, logging, importlib.util as u, pathlib
+    n = "_lineaje_gr_stub_client"
+    if n in sys.modules: return sys.modules[n]
+    h = pathlib.Path(_f or ".").resolve().parent
+    d = [h, *h.parents][:8]
+    p = next((x / "gr_stub_client.py" for x in d if (x / "gr_stub_client.py").is_file()), None)
+    try:
+        s = u.spec_from_file_location(n, p) if p else None
+        if s is None: raise FileNotFoundError("gr_stub_client.py")
+        m = sys.modules[n] = u.module_from_spec(s); s.loader.exec_module(m); return m
+    except Exception as e:
+        sys.modules.pop(n, None)
+        w = ("gr_stub_client.py not found for %s (searched: %s)" % (_f or "<no __file__>", ", ".join(map(str, d)))
+             if p is None else "%s failed to load (%s%s)" % (p, type(e).__name__,
+                                                          " line %s" % e.lineno if isinstance(e, SyntaxError) else ""))
+        w = ("Lineaje guardrail NOT active: " + w + ". Calls pass through unchecked; set GR_REQUIRE_CLIENT=1 to fail "
+             "instead. Each deploy unit needs gr_stub_client.py beside its code and GR_SERVICE_URL plus credentials as "
+             "environment variables.")
+        if os.environ.get("GR_REQUIRE_CLIENT", "").strip() == "1": raise ImportError(w) from (None if p is None else e)
+        z = sys.__dict__.setdefault("_lineaje_gr_null", __import__('types').SimpleNamespace(STUB_API=999999, GuardrailUnavailableError=type('GuardrailUnavailableError', (PermissionError,), {}), SiteDescriptor=lambda *a, **k: None, new_interaction_id=lambda *a, **k: None, enforce=lambda _s, _p, *a, **k: _p, enforce_request=lambda _s, _p, *a, **k: _p, enforce_reply=lambda _s, _p, *a, **k: _p, _lineaje_seen=set()))
+        k = "missing" if p is None else (str(p), type(e).__name__)
+        if k not in z._lineaje_seen:
+            z._lineaje_seen.add(k); g = logging.getLogger("lineaje.guardrail"); g.log(30 if p is None else 40, w)
+            if g.hasHandlers(): sys.stderr.write(w + "\n")
+        return z
+__import__("sys").__dict__.setdefault("_lineaje_gr_load_v1", _lineaje_gr_load)
+del _lineaje_gr_load
+def _lineaje_load_gr_client():
+    """Lineaje-added: this file's gr_stub_client.py (the loader _lineaje_gr_load registered)."""
+    return __import__("sys").__dict__["_lineaje_gr_load_v1"](globals().get("__file__"))
+if __import__("os").environ.get("GR_REQUIRE_CLIENT", "").strip() == "1": __import__("sys").__dict__["_lineaje_gr_load_v1"](globals().get("__file__"))
+
 
 import base64
 import json
@@ -38,9 +75,41 @@ MCP_CALL_LOG: list[dict] = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    logger.info("Acme Loan Processor backend starting up...")
+    _lineaje_payload = "Acme Loan Processor backend starting up..."
+    # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in lifespan).
+    #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:52cd5e1563c281eb59175707ccd3688da21f3c7a1de4047fed405493384d0487'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:52cd5e1563c281eb59175707ccd3688da21f3c7a1de4047fed405493384d0487', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'line': 41, 'function': 'lifespan'}, 'file': 'backend/main.py', 'line': 41, 'function': 'lifespan', 'agent_name': 'lifespan', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+            __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+            raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+        _lineaje_payload = await _gr_client.aenforce(_gr_site, _lineaje_payload, content_type='application/json')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
+    logger.info(_lineaje_payload)
     yield
-    logger.info("Acme Loan Processor backend shutting down...")
+    _lineaje_payload = "Acme Loan Processor backend shutting down..."
+    # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in lifespan).
+    #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:b04e395d69cd0370a4dfb68d0277680e7f2b44f5cb489c6fe7a57103fc3f08bb'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:b04e395d69cd0370a4dfb68d0277680e7f2b44f5cb489c6fe7a57103fc3f08bb', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'line': 43, 'function': 'lifespan'}, 'file': 'backend/main.py', 'line': 43, 'function': 'lifespan', 'agent_name': 'lifespan', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+            __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+            raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+        _lineaje_payload = await _gr_client.aenforce(_gr_site, _lineaje_payload, content_type='application/json')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        pass
+    logger.info(_lineaje_payload)
 
 
 app = FastAPI(
@@ -122,12 +191,41 @@ async def chat(request: ChatRequest):
     3. Routes the request through the Orchestrator Agent
     4. Returns the agent response
     """
+    # LINEAJE: runtime guardrail checks `request` as it flows from the user interface to the agent, after the agent receives it (in chat).
+    #   Detected: this statement moves data from the user interface to the agent with no runtime policy check (detection confidence: medium).
+    #   Decision: the Guardrail evaluates AI_APP_SEC_070; sensitive values in `request` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:de0709405a9b3e5d13ba537698bc4bea1cd750ea96d36e7028e316c73ab3d2e6'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:de0709405a9b3e5d13ba537698bc4bea1cd750ea96d36e7028e316c73ab3d2e6', phase='post_agent_receive', boundary={'source': 'user_interface', 'sink': 'agent_message'}, fail_mode='BLOCK', source_type='user_interface', destination_type='agent', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'function': 'chat', 'line': 115}, 'destination': {'entity_type': 'agent', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN'}, 'file': 'backend/main.py', 'line': 125, 'function': 'chat', 'agent_name': 'chat', 'agent_name_source': 'inferred_from_function', 'boundary_id': 'bnd:b85ab52daf5b0dd3'})
+    try:
+        if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+            __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+            raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+        request = await _gr_client.aenforce(_gr_site, request, content_type='application/json', variable_name='request', source_file=__file__, before_line=125)
+    except _gr_client.GuardrailUnavailableError:
+        pass
     try:
         file_contents = []
         if request.attachments:
             for attachment in request.attachments:
+                _lineaje_payload = "Processing attachment"
+                # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in chat).
+                #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+                #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+                #   Do not remove without review. site_id='site:sha256:5347de939fad3f67c61ec8abd3e2ed1072ef9fde5ba07d7994cd2ab152b25677'
+                _gr_client = _lineaje_load_gr_client()
+                _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:5347de939fad3f67c61ec8abd3e2ed1072ef9fde5ba07d7994cd2ab152b25677', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'line': 129, 'function': 'chat'}, 'file': 'backend/main.py', 'line': 129, 'function': 'chat', 'agent_name': 'chat', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+                try:
+                    if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                        __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                        raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+                    _lineaje_payload = await _gr_client.aenforce(_gr_site, _lineaje_payload, content_type='application/json')
+                except _gr_client.GuardrailUnavailableError:
+                    pass
+                except PermissionError:
+                    pass
                 logger.info(
-                    "Processing attachment",
+                    _lineaje_payload,
                     extra={
                         "file_name": attachment.name,
                         "file_type": attachment.type,
@@ -139,8 +237,24 @@ async def chat(request: ChatRequest):
                     }
                 )
 
+                _lineaje_content = attachment.content
+                # LINEAJE: runtime guardrail checks `_lineaje_content` as it flows from file storage to the agent (in chat).
+                #   Detected: this statement moves data from file storage to the agent with no runtime policy check (detection confidence: high).
+                #   Decision: the Guardrail evaluates AI_APP_SEC_070, AI_DAT_SEC_023, AI_DAT_SEC_024; sensitive values in `_lineaje_content` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+                #   Do not remove without review. site_id='site:sha256:c9c2ffa92f987dc9a96bb9d56ceae4dd67f819cce7ff9202eca589b42d7cf2fc'
+                _gr_client = _lineaje_load_gr_client()
+                _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:c9c2ffa92f987dc9a96bb9d56ceae4dd67f819cce7ff9202eca589b42d7cf2fc', phase='file_upload', boundary={'source': 'file_upload', 'sink': 'agent_context'}, fail_mode='BLOCK', source_type='file_storage', destination_type='agent', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'line': 142, 'function': 'chat'}, 'file': 'backend/main.py', 'line': 142, 'function': 'chat', 'agent_name': 'chat', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+                try:
+                    if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                        __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                        raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+                    _lineaje_content = await _gr_client.aenforce(_gr_site, _lineaje_content, content_type='application/json')
+                except _gr_client.GuardrailUnavailableError:
+                    pass
+                except PermissionError:
+                    raise
                 processed = await process_file_attachment(
-                    content=attachment.content,
+                    content=_lineaje_content,
                     filename=attachment.name,
                     content_type=attachment.type
                 )
@@ -177,8 +291,24 @@ async def chat(request: ChatRequest):
     except HTTPException:
         raise
     except Exception as e:
+        _lineaje_payload = "Error processing chat request"
+        # LINEAJE: runtime guardrail checks `_lineaje_payload` as it flows from the agent to the application log, before it is written to the log (in chat).
+        #   Detected: this statement moves data from the agent to the application log with no runtime policy check (detection confidence: high).
+        #   Decision: the Guardrail evaluates AI_DAT_SEC_010; sensitive values in `_lineaje_payload` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+        #   Do not remove without review. site_id='site:sha256:c92f8fbbb752768d484c49ceb3fca53dae96721427d0b4e041c0fc5d7c58c4a6'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:c92f8fbbb752768d484c49ceb3fca53dae96721427d0b4e041c0fc5d7c58c4a6', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, fail_mode='BLOCK', source_type='agent', destination_type='log', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'line': 180, 'function': 'chat'}, 'file': 'backend/main.py', 'line': 180, 'function': 'chat', 'agent_name': 'chat', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+        try:
+            if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+                __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+                raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+            _lineaje_payload = await _gr_client.aenforce(_gr_site, _lineaje_payload, content_type='application/json')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         logger.error(
-            "Error processing chat request",
+            _lineaje_payload,
             extra={
                 # VULNERABILITY: Error context includes full state
                 "error": str(e),
@@ -205,6 +335,19 @@ async def upload_file(file: UploadFile = File(...)):
     """
     Direct file upload endpoint.
     """
+    # LINEAJE: runtime guardrail checks `file` as it flows from the user interface to the agent, after the agent receives it (in upload_file).
+    #   Detected: this statement moves data from the user interface to the agent with no runtime policy check (detection confidence: medium).
+    #   Decision: the Guardrail evaluates AI_APP_SEC_070; sensitive values in `file` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:0f7e82873c59016924ec43433dae7d48d117c98d0142a3487e7950150b2bae57'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:0f7e82873c59016924ec43433dae7d48d117c98d0142a3487e7950150b2bae57', phase='post_agent_receive', boundary={'source': 'user_interface', 'sink': 'agent_message'}, fail_mode='BLOCK', source_type='user_interface', destination_type='agent', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'function': 'upload_file', 'line': 204}, 'destination': {'entity_type': 'agent', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN'}, 'file': 'backend/main.py', 'line': 208, 'function': 'upload_file', 'agent_name': 'upload_file', 'agent_name_source': 'inferred_from_function', 'boundary_id': 'bnd:699f46fdf754c8da'})
+    try:
+        if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+            __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+            raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+        file = await _gr_client.aenforce(_gr_site, file, content_type='application/json', variable_name='file', source_file=__file__, before_line=208)
+    except _gr_client.GuardrailUnavailableError:
+        pass
     content = await file.read()
     if (file.content_type or "").startswith("image/") or file.content_type in {
         "application/pdf",
@@ -215,6 +358,21 @@ async def upload_file(file: UploadFile = File(...)):
     else:
         processed_content = content.decode("utf-8", errors="ignore")
 
+    # LINEAJE: runtime guardrail checks `processed_content` as it flows from file storage to the agent (in upload_file).
+    #   Detected: this statement moves data from file storage to the agent with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates AI_APP_SEC_070, AI_DAT_SEC_023, AI_DAT_SEC_024; sensitive values in `processed_content` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:69cc0cd647c891bde403a5a8db856ac366d5257a2cf64af808f4638764db7cdc'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:69cc0cd647c891bde403a5a8db856ac366d5257a2cf64af808f4638764db7cdc', phase='file_upload', boundary={'source': 'file_upload', 'sink': 'agent_context'}, fail_mode='BLOCK', source_type='file_storage', destination_type='agent', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'line': 218, 'function': 'upload_file'}, 'file': 'backend/main.py', 'line': 218, 'function': 'upload_file', 'agent_name': 'upload_file', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+            __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+            raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+        processed_content = await _gr_client.aenforce(_gr_site, processed_content, content_type='application/json')
+    except _gr_client.GuardrailUnavailableError:
+        pass
+    except PermissionError:
+        raise
     processed = await process_file_attachment(
         content=processed_content,
         filename=file.filename,
@@ -239,6 +397,19 @@ async def mock_mcp_server(server_key: str, request: Request):
     These handlers intentionally accept broad payloads so the insecure agent
     flows can be exercised end-to-end without external infrastructure.
     """
+    # LINEAJE: runtime guardrail checks `server_key` as it flows from the user interface to the agent, after the agent receives it (in mock_mcp_server).
+    #   Detected: this statement moves data from the user interface to the agent with no runtime policy check (detection confidence: medium).
+    #   Decision: the Guardrail evaluates AI_APP_SEC_070; sensitive values in `server_key` are masked in place; a policy violation stops the call (fail_mode=BLOCK). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:c15d3d526668bf7f3d5e5f9459681c61a4319d31818a07236fcff33917beda69'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:c15d3d526668bf7f3d5e5f9459681c61a4319d31818a07236fcff33917beda69', phase='post_agent_receive', boundary={'source': 'user_interface', 'sink': 'agent_message'}, fail_mode='BLOCK', source_type='user_interface', destination_type='agent', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'function': 'mock_mcp_server', 'line': 235}, 'destination': {'entity_type': 'agent', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN'}, 'file': 'backend/main.py', 'line': 242, 'function': 'mock_mcp_server', 'agent_name': 'mock_mcp_server', 'agent_name_source': 'inferred_from_function', 'boundary_id': 'bnd:03f0ea54b368a0c2'})
+    try:
+        if not __import__('builtins').hasattr(_gr_client, 'aenforce'):
+            __import__("logging").getLogger("lineaje.gr_client").error("gr_stub_client.py predates aenforce (STUB_API 5): this site is NOT enforced; replace gr_stub_client.py with the current companion")
+            raise _gr_client.GuardrailUnavailableError("stale gr_stub_client.py: no aenforce")
+        server_key = await _gr_client.aenforce(_gr_site, server_key, content_type='application/json', variable_name='server_key', source_file=__file__, before_line=242)
+    except _gr_client.GuardrailUnavailableError:
+        pass
     payload = await request.json()
     params = payload.get("params", {})
     tool_name = params.get("name", "")
@@ -271,6 +442,16 @@ async def get_mcp_servers():
 
 
 def _handle_mock_mcp_call(server_key: str, tool_name: str, arguments: dict) -> dict:
+    # LINEAJE: runtime guardrail checks `arguments` as it flows from the agent to an external endpoint, before it leaves the application (in _handle_mock_mcp_call).
+    #   Detected: this statement moves data from the agent to an external endpoint with no runtime policy check (detection confidence: medium).
+    #   Decision: the Guardrail evaluates the policies enabled for this boundary; sensitive values in `arguments` are masked in place; a policy violation is logged and the call continues (fail_mode=ALLOW_WITH_AUDIT). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:bf48fb8df6f3c4a33e73ddda7b49947aa2e1038fdb73f8076a7236e8b782a9f3'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:bf48fb8df6f3c4a33e73ddda7b49947aa2e1038fdb73f8076a7236e8b782a9f3', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'external_endpoint'}, fail_mode='ALLOW_WITH_AUDIT', source_type='agent', destination_type='external', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'line': 274, 'function': '_handle_mock_mcp_call'}, 'file': 'backend/main.py', 'line': 274, 'function': '_handle_mock_mcp_call', 'agent_name': '_handle_mock_mcp_call', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        arguments = _gr_client.enforce(_gr_site, arguments, content_type='application/json', variable_name='arguments', source_file=__file__, before_line=274)
+    except _gr_client.GuardrailUnavailableError:
+        pass
     timestamp = datetime.now(timezone.utc).isoformat()
     log_entry = {
         "server_key": server_key,
@@ -354,6 +535,16 @@ def _handle_mock_mcp_call(server_key: str, tool_name: str, arguments: dict) -> d
             "timestamp": timestamp,
         }
 
+    # LINEAJE: runtime guardrail checks `arguments` as it flows from the agent to an external endpoint, before it leaves the application (in _handle_mock_mcp_call).
+    #   Detected: this statement moves data from the agent to an external endpoint with no runtime policy check (detection confidence: high).
+    #   Decision: the Guardrail evaluates the policies enabled for this boundary; sensitive values in `arguments` are masked in place; a policy violation is logged and the call continues (fail_mode=ALLOW_WITH_AUDIT). If the Guardrail is unreachable, the call continues unchanged.
+    #   Do not remove without review. site_id='site:sha256:786d4124606bb4cb592c6403d85bc43eee5b0072931cae42ab87c6bb5a0dcda4'
+    _gr_client = _lineaje_load_gr_client()
+    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:786d4124606bb4cb592c6403d85bc43eee5b0072931cae42ab87c6bb5a0dcda4', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'external_endpoint'}, fail_mode='ALLOW_WITH_AUDIT', source_type='agent', destination_type='external', components={'source': {'entity_type': 'agent', 'unique_org_id': 'vdna_zEnOQxQLzX8fhXvN', 'repository_uri': 'https://github.com/lineaje-demo/acme_loan_processor', 'file_path': 'backend/main.py', 'line': 307, 'name': 'Google'}, 'invocation': {'file': 'backend/main.py', 'line': 357, 'function': '_handle_mock_mcp_call'}, 'file': 'backend/main.py', 'line': 357, 'function': '_handle_mock_mcp_call', 'agent_name': '_handle_mock_mcp_call', 'agent_name_source': 'inferred_from_function', 'not_on_graph': True})
+    try:
+        arguments = _gr_client.enforce(_gr_site, arguments, content_type='application/json', variable_name='arguments', source_file=__file__, before_line=357)
+    except _gr_client.GuardrailUnavailableError:
+        pass
     return {
         "server": server_key,
         "tool": tool_name,
